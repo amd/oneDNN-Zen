@@ -77,15 +77,17 @@ The contribution must satisfy the three [Library Functionality Guidelines](../..
 
 ## 3. ZenDNN Value Add (Background)
 
-ZenDNN ships several capabilities that we want to bring through into oneDNN. Each is what differentiates the AMD-tuned path from a stock JIT-only impl on Zen-class CPUs.
+**ZenDNN delivers the best CPU performance on AMD CPUs today** &mdash; it is AMD's purpose-built primitive library for Zen3 / Zen4 / Zen5 / Zen6 and ships in production through `zentorch` and other framework integrations. Every capability below exists to extract that performance on AMD silicon; bringing it into oneDNN through the `zen64` module is what gives oneDNN consumers (PyTorch, TensorFlow, ONNX Runtime, vLLM, &hellip;) the same AMD-CPU performance they would otherwise have to reach for `zentorch` to get.
+
+The capabilities below are what differentiates ZenDNN's AMD-tuned path from a stock JIT-only impl on Zen-class CPUs.
 
 ### 3.1 Multi-backend Auto Tuner (TBP + Decision Tree)
 
-ZenDNN's MatMul / BMM / GEMV path runs an internal Auto Tuner that picks between four candidate backends per problem size: native ZenDNN kernels, AOCL-DLP, libxsmm, and FBGEMM. Selection is driven by:
+ZenDNN's MatMul / BMM / GEMV path runs an internal Auto Tuner that picks between several candidate backends per problem size: native ZenDNN kernels, **oneDNN**, AOCL-DLP, libxsmm, and FBGEMM. The presence of oneDNN itself in the candidate set is important &mdash; for shapes where oneDNN's existing JIT path is already best on Zen, the Auto Tuner picks oneDNN, so the `zen64` module is never a regression even when ZenDNN's other backends would lose to oneDNN. Selection is driven by:
 - **Time-Based Profiling (TBP)** &mdash; the first call for a given shape probes a small set of candidates and caches the winner.
 - **Decision Tree** &mdash; static heuristics (problem dimensions, dtype, layout) that resolve without profiling for shapes the tree already covers.
 
-Vertical&nbsp;1 makes this Auto Tuner the dispatch core inside the `zen64::matmul_t::execute()` body; oneDNN sees a single primitive that picks the best backend per call.
+Vertical&nbsp;1 makes this Auto Tuner the dispatch core inside the `zen64::matmul_t::execute()` body; oneDNN sees a single primitive that picks the best backend per call. When the Auto Tuner picks "oneDNN" as its inner backend, `zen64::matmul_t` cleanly returns `status::unimplemented` from PD `init()` for that shape so that oneDNN's own dispatcher continues with `brgemm_matmul_t` &mdash; avoiding any double-dispatch and keeping the JIT path hot.
 
 ### 3.2 Parallel primitive
 
