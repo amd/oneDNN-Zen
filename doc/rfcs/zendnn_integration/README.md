@@ -4,7 +4,7 @@
 **Draft** &nbsp;|&nbsp; AMD-Zenai/oneDNN-ZenDNN &nbsp;|&nbsp; Branch: `rfc/zendnn-integration` &nbsp;|&nbsp; Companion RFC: [`doc/rfcs/embedding_bag/`](../embedding_bag/README.md)
 
 ## Authors
-- AMD-Zenai team
+- AMD ZenDNN team
 
 ## Summary
 
@@ -690,7 +690,7 @@ The gating between Vertical&nbsp;1 and Vertical&nbsp;2 is loose: V2 items can be
 
 4. **Reorder strategy choice.** Strategy A (ZenDNN-internal cache, PoC-current) is simple but opaque to oneDNN's primitive cache. Strategy B (oneDNN-side reorder ahead of time, in progress) is more idiomatic but more PD-side plumbing. Open question: do we ship Vertical&nbsp;1 first PR with Strategy A only, or wait for Strategy B? Current plan: ship Strategy A, document Strategy B as a follow-up PR.
 
-5. **Maintenance burden.** Vertical&nbsp;1 means oneDNN reviewers see ZenDNN-specific commits going forward. Mitigation: AMD-Zenai team owns the `zen64` directory and the per-primitive adapter classes; oneDNN maintainers review the integration plumbing (impl-list registration, build option, fallback semantics) but not the kernels themselves.
+5. **Maintenance burden.** Vertical&nbsp;1 means oneDNN reviewers see ZenDNN-specific commits going forward. Mitigation: the AMD ZenDNN team owns the `zen64` directory and the per-primitive adapter classes; oneDNN maintainers review the integration plumbing (impl-list registration, build option, fallback semantics) but not the kernels themselves.
 
 6. **Performance gate at upstream.** Per `CONTRIBUTING.md`, every change must show "material workload-level impact." We must ship benchdnn perf and vLLM model-level numbers with each production PR. Risk: if Strategy A's first-call reorder cost dominates a particular benchmark, the perf argument is weaker; mitigation is Strategy B (ahead-of-time reorder).
 
