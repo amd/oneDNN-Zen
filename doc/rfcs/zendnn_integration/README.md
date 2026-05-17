@@ -1,7 +1,7 @@
 # RFC: ZenDNN Integration in oneDNN — `zen64` Module + Native Upstream Contributions
 
 ## Status
-**Draft** &nbsp;|&nbsp; AMD-Zenai/oneDNN-ZenDNN &nbsp;|&nbsp; Branch: `rfc/embedding-bag` &nbsp;|&nbsp; Companion RFC: [`doc/rfcs/embedding_bag/`](../embedding_bag/README.md)
+**Draft** &nbsp;|&nbsp; AMD-Zenai/oneDNN-ZenDNN &nbsp;|&nbsp; Branch: `rfc/zendnn-integration` &nbsp;|&nbsp; Companion RFC: [`doc/rfcs/embedding_bag/`](../embedding_bag/README.md)
 
 ## Authors
 - AMD-Zenai team

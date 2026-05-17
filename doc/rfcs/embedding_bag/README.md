@@ -1,7 +1,7 @@
 # RFC: Embedding and Embedding-Bag Primitive in oneDNN
 
 ## Status
-**Draft** &nbsp;|&nbsp; AMD-Zenai/oneDNN-ZenDNN &nbsp;|&nbsp; Branch: `rfc/embedding-bag`
+**Draft** &nbsp;|&nbsp; AMD-Zenai/oneDNN-ZenDNN &nbsp;|&nbsp; Branch: `rfc/zendnn-integration` &nbsp;|&nbsp; Umbrella RFC: [`doc/rfcs/zendnn_integration/`](../zendnn_integration/README.md)
 
 ## Authors
 - AMD-Zenai team
