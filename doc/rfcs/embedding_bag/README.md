@@ -7,19 +7,25 @@
 - AMD-Zenai team
 
 ## Summary
-This RFC proposes adding a new `embedding_bag` primitive to oneDNN, with `embedding` (lookup-only) exposed as a thin C++ wrapper over the same primitive. The design follows existing oneDNN conventions for primitives such as `softmax` and `reduction`, and is compatible with PyTorch's `nn.EmbeddingBag` semantics. AMD-specific acceleration is provided by an internal implementation that delegates to ZenDNN's existing `embedding_bag_direct` / `group_embedding_bag_direct` kernels; a portable reference implementation is always available.
+This RFC proposes adding a new `embedding_bag` primitive to oneDNN, with `embedding` (lookup-only) exposed as a thin C++ wrapper over the same primitive. The design follows existing oneDNN conventions for primitives such as `softmax` and `reduction`, complies with the project [Coding Standards](../../../CODING_STANDARDS.md) and [Contributing guidelines](../../../CONTRIBUTING.md), and is compatible with PyTorch `nn.EmbeddingBag`, TensorFlow `tf.nn.embedding_lookup_sparse`, and ONNX Runtime `EmbedLayerNormalization` consumer semantics.
+
+Optimized x64 kernels live **natively** under `src/cpu/x64/`, following the JIT pattern used by `jit_uni_softmax` and `jit_uni_reduction`. The kernels are seeded from AMD ZenDNN's existing `lowoha::embag` AVX-512/AVX-512-FP16 implementations &mdash; ZenDNN is the *source* of those kernels for porting, **not** a runtime dependency. After this contribution lands, oneDNN has no link-time, runtime, or build-time dependency on ZenDNN. A portable reference implementation under `src/cpu/` is always available as the correctness fallback and lights up for any unsupported (algorithm, dtype, ISA) combination.
 
 ---
 
 ## 1. Background and Motivation
 
-Embedding lookups and embedding-bag reductions are core building blocks for recommendation models (DLRM, DCNv2, etc.) and NLP models that consume token-id sequences. Today, frameworks (PyTorch's `nn.EmbeddingBag`, TF, ONNX Runtime) implement these on CPU either via per-framework kernels, FBGEMM, or vendor libraries. oneDNN currently has **no equivalent primitive**: the closest dense neighbours (`reduction`, `gather` in graph) do not cover the *indexed lookup + variable-length bag reduction* semantics.
+Embedding lookups and embedding-bag reductions are core building blocks for recommendation models (DLRM, DCNv2, MMoE, DIN, etc.) and NLP/transformer models that consume token-id sequences. Today, frameworks (PyTorch `nn.EmbeddingBag`, TensorFlow `embedding_lookup_sparse`, ONNX Runtime `EmbedLayerNormalization`) implement these on CPU either via per-framework hand-rolled kernels, FBGEMM, or vendor libraries. oneDNN currently has **no equivalent primitive** &mdash; the closest dense neighbours (`reduction`, graph `gather`) do not cover *indexed lookup + variable-length bag reduction* semantics.
 
-ZenDNN already has highly optimized AVX-512 / AVX-512-FP16 implementations for these operations exposed through its internal `lowoha::embag` API (see appendix A). The goal of this RFC is to expose this functionality through a **first-class oneDNN primitive** that:
+The kernels for this contribution come from AMD's ZenDNN, which has shipped highly optimized AVX-512 / AVX-512-FP16 implementations through its internal `lowoha::embag` API. This RFC proposes upstreaming those kernels into oneDNN as a first-class primitive: re-implemented natively in oneDNN's `src/cpu/x64/` JIT infrastructure (Xbyak generators, `jit_generator_t`, `parallel_nd*`, scratchpad), reviewed and integrated to oneDNN's coding standards. After integration, ZenDNN itself is no longer in the runtime path.
 
-1. Looks and feels like every other oneDNN primitive (op-desc → primitive-desc → primitive → execute).
-2. Plugs into oneDNN's CPU dispatch system so that the ZenDNN-backed implementation is selected automatically on AMD CPUs, with a portable reference implementation as the fallback on every other platform.
-3. Maps cleanly onto PyTorch / ONNX consumer semantics so frameworks can adopt it with minimal glue.
+The contribution must satisfy the three [Library Functionality Guidelines](../../../CONTRIBUTING.md#library-functionality-guidelines) that gate every new oneDNN primitive:
+
+| Criterion | Justification |
+|---|---|
+| **Performance** &mdash; material workload-level impact | DLRM-class recommendation models spend a substantial fraction of CPU time in the embedding stage; ZenDNN's existing AVX-512 implementation has demonstrated meaningful speed-ups over framework-native paths on AMD CPUs. The optimized JIT impl proposed here ports those gains into oneDNN, validated end-to-end with benchdnn shape sets representative of DLRM. |
+| **Generality** &mdash; usable across multiple frameworks | The primitive's semantics (indices + offsets + per-sample weights + reduction mode + `padding_idx` + `include_last_offset`) match PyTorch `nn.EmbeddingBag` exactly; the same algebraic shape covers TensorFlow's `embedding_lookup_sparse` (dense weights mode) and ONNX Runtime's embedding fast paths. The lookup-only (no-reduction) mode covers PyTorch `nn.Embedding` and ONNX `Gather` (axis 0) for most practical cases. |
+| **Complexity** &mdash; non-trivial to implement directly in apps | High-quality CPU embedding implementations require careful work splitting (table-threaded vs bag-threaded vs CCD-aware), int32/int64 indices, optional per-sample weights without branchy inner loops, ISA-specific load/scatter strategies (AVX-512 BF16, AVX-512-FP16), and quantized-table support. Frameworks repeatedly re-implement this; centralizing it in oneDNN saves duplication and keeps the kernel-level optimizations in one place. |
 
 ## 2. Goals and Non-Goals
 
@@ -27,43 +33,75 @@ ZenDNN already has highly optimized AVX-512 / AVX-512-FP16 implementations for t
 - One new primitive kind: `dnnl_embedding_bag`.
 - Forward pass on CPU.
 - Algorithms: `sum`, `mean`, `max`, and `lookup` (no reduction).
-- Data types (Phase 1): `f32` table, `f32` output, `s32`/`s64` indices and offsets.
-- Data types (Phase 2): `bf16`, `f16` table/output (subject to ISA support).
+- Data types (Phase 1): `f32` table and output, `s32`/`s64` indices and offsets, `f32` per-sample weights.
+- Data types (Phase 2): `bf16`, `f16` table/output (lights up on the ISAs that support them; ref impl always works).
 - Optional per-sample weights, optional `padding_idx`, optional `include_last_offset`.
-- ZenDNN-backed CPU implementation behind oneDNN's standard dispatch — no API surface for kernel/threading choice.
+- Dispatch through oneDNN's standard impl-list mechanism &mdash; no public API for kernel selection or threading strategy.
 - benchdnn driver, gtest coverage, example, user-guide doc.
 
 ### Non-Goals (initial release)
 - Backward / training. (Tracked as future work in Phase 4; see §10.)
-- GPU implementation. (Stub list returns empty until an Intel/SYCL impl exists.)
-- Quantized (`s8` / `s4` / `u4`) embedding tables — these are valuable for DLRM-style inference and are tracked in Phase 3 (§10).
-- A separate `group_embedding_bag` primitive — see §12.B for the alternative considered and why we defer it.
+- GPU implementation. (Impl-list `CASE` returns `empty_list` initially, matching the precedent of `sdpa` / `gated_mlp` in `src/cpu/cpu_engine.hpp`.)
+- Quantized (`s8` / `s4` / `u4`) embedding tables &mdash; valuable for DLRM-style inference, tracked in Phase 3 (§10).
+- A separate `group_embedding_bag` primitive &mdash; see §12.B for the alternative considered and why we defer it.
 
-## 3. oneDNN Convention Recap
+## 3. oneDNN Conventions and Coding Standards
 
-Every primitive in oneDNN follows the same skeleton. The new primitive must respect it. Files cited below are the patterns we copy.
+### 3.1 Per-primitive convention map
 
-| Layer | Files (existing examples) | What we add |
+Every primitive in oneDNN follows the same skeleton. The new primitive must respect it. Files cited below are the patterns we mirror.
+
+| Layer | Existing examples | What we add |
 | --- | --- | --- |
 | Primitive kind enum | `include/oneapi/dnnl/dnnl_types.h` (`dnnl_primitive_kind_t`) | `dnnl_embedding_bag` |
 | Algorithm enum | `include/oneapi/dnnl/dnnl_types.h` (`dnnl_alg_kind_t`) | `dnnl_embedding_bag_sum/_mean/_max`, `dnnl_embedding_lookup` |
 | Argument map | `DNNL_ARG_*` in `dnnl_types.h` | reuse `SRC`, `SRC_1`, `SRC_2`, `WEIGHTS`, `DST` (named aliases optional) |
-| Internal op-desc struct | `src/common/opdesc.hpp` (e.g. `softmax_desc_t`, `reduction_desc_t`) | `embedding_bag_desc_t` |
+| Internal op-desc | `src/common/opdesc.hpp` (`softmax_desc_t`, `reduction_desc_t`) | `embedding_bag_desc_t` |
 | C API | `include/oneapi/dnnl/dnnl.h` (e.g. `dnnl_softmax_forward_primitive_desc_create`) | `dnnl_embedding_bag_primitive_desc_create` |
-| C++ wrapper | `include/oneapi/dnnl/dnnl.hpp` (e.g. `dnnl::softmax_forward`, `dnnl::reduction`) | `dnnl::embedding_bag` (+ `dnnl::embedding` thin wrapper) |
-| Desc init + entry impl | `src/common/<prim>.cpp` (e.g. `src/common/softmax.cpp`) | `src/common/embedding_bag.cpp` |
-| Primitive-desc base | `src/common/<prim>_pd.hpp` (e.g. `src/common/reduction_pd.hpp`) | `src/common/embedding_bag_pd.hpp` |
+| C++ wrapper | `include/oneapi/dnnl/dnnl.hpp` (`dnnl::softmax_forward`, `dnnl::reduction`) | `dnnl::embedding_bag` (+ `dnnl::embedding` thin wrapper) |
+| Desc init + C entry | `src/common/<prim>.cpp` (`src/common/softmax.cpp`) | `src/common/embedding_bag.cpp` |
+| PD base class | `src/common/<prim>_pd.hpp` (`src/common/reduction_pd.hpp`) | `src/common/embedding_bag_pd.hpp` |
+| CPU PD typedef | `src/cpu/cpu_<prim>_pd.hpp` (`src/cpu/cpu_softmax_pd.hpp`) | `src/cpu/cpu_embedding_bag_pd.hpp` |
 | Whitelist | `src/common/primitive_desc_iface.cpp::known_primitive_kind` | add `embedding_bag` |
-| C↔C++ kind/alg map | `src/common/c_types_map.hpp` | mirror new enums |
-| CPU impl list | `src/cpu/cpu_<prim>_list.cpp` (e.g. `cpu_reduction_list.cpp`) + `DECLARE_IMPL_LIST` and `CASE` in `src/cpu/cpu_engine.hpp` | `src/cpu/cpu_embedding_bag_list.cpp`, list reg in engine |
+| C↔C++ enum mirror | `src/common/c_types_map.hpp` | mirror new enums |
+| CPU impl list | `src/cpu/cpu_<prim>_list.cpp` (`cpu_reduction_list.cpp`) + `DECLARE_IMPL_LIST` & `CASE` in `src/cpu/cpu_engine.hpp` | `src/cpu/cpu_embedding_bag_list.cpp` + engine plumbing |
 | Reference impl | `src/cpu/ref_<prim>.{hpp,cpp}` | `src/cpu/ref_embedding_bag.{hpp,cpp}` |
-| Optimized impl | `src/cpu/x64/jit_*` (e.g. `jit_uni_reduction.cpp`) | `src/cpu/x64/zendnn/zendnn_embedding_bag.{hpp,cpp}` |
-| GPU impl list | `src/gpu/gpu_<prim>_list.cpp` + `CASE` in `gpu_impl_list.cpp` | empty list initially (returns `empty_list`, like `sdpa`/`gated_mlp` do today) |
-| benchdnn driver | `tests/benchdnn/<prim>/`, dispatch in `benchdnn.cpp`, harnesses in `tests/benchdnn/inputs/<prim>/`, doc `tests/benchdnn/doc/driver_<prim>.md` | full driver |
+| Optimized x64 impl | `src/cpu/x64/jit_uni_<prim>.{hpp,cpp}` (`jit_uni_softmax.{hpp,cpp}`, ~398/1856 lines) or split form (`jit_uni_reduction.*` + `jit_uni_reduction_kernel.*`) | `src/cpu/x64/jit_uni_embedding_bag.{hpp,cpp}` (split if kernel grows) |
+| GPU impl list | `src/gpu/gpu_<prim>_list.cpp` + `CASE` in `gpu_impl_list.cpp` | `CASE` returns `empty_list` for now (same shape as `sdpa`, `gated_mlp` precedent) |
+| benchdnn driver | `tests/benchdnn/<prim>/` (5 files) + dispatch in `benchdnn.cpp` + harnesses in `tests/benchdnn/inputs/<prim>/` + doc `tests/benchdnn/doc/driver_<prim>.md` | full driver |
 | Example | `examples/primitives/<prim>.cpp` | `examples/primitives/embedding_bag.cpp` |
 | User-guide doc | `doc/primitives/<prim>.md` | `doc/primitives/embedding_bag.md` |
 
-oneDNN exposes only memory descriptors and scalar parameters in the public C API; it does not expose op-descriptor structs publicly. Threading and kernel selection are internal concerns; users never pick a kernel. ZenDNN's `embag_kernel_t` and `eb_thread_algo_t` therefore have no counterpart in the public oneDNN API.
+oneDNN exposes only memory descriptors and scalar parameters in the public C API; it does not expose op-descriptor structs publicly. Threading and kernel selection are internal concerns; users never pick a kernel.
+
+### 3.2 Coding-standards adherence
+
+Every file added by this contribution must comply with the project [`CODING_STANDARDS.md`](../../../CODING_STANDARDS.md), automatically enforced where possible:
+
+| Rule | How we comply |
+| --- | --- |
+| `clang-format -style=file -i` on every changed `.cpp/.hpp` | Run as a pre-commit step; CI rejects unformatted patches |
+| `clang-tidy` checks per `.clang-tidy` (top-level) | All new code passes locally before PR; pre-existing exceptions inherited only when surrounding code already has them |
+| No `using namespace ...` in headers | Per CODING_STANDARDS §General; we keep `using` directives inside anonymous namespaces in `.cpp` only |
+| Naming: `lower_case_t` types, `lower_case` functions, `_t` suffix on type aliases | Matches `softmax_pd_t`, `jit_uni_softmax_fwd_t`, `embag_params_t` style |
+| Use `src` / `dst` (not `input` / `output`) | Already adopted in our argument naming and op-desc fields |
+| Prefer `IMPLICATION`, `one_of`, `everyone_is`, `utils::one_of` | Used throughout PD `init()` validation |
+| Innermost-scope variable declarations | Standard C++; enforced by review |
+| Properly named constants instead of magic numbers | E.g., `static constexpr int simd_w = ...;` rather than literal `16` |
+| `Xbyak::Label` for labels (no `char[]`) | Already standard in `jit_uni_softmax.cpp` |
+| Commit messages: `<scope>[: <subscope>...]: <imperative summary>`, body wrapped at 72 | Each PR commit follows this; example: `cpu: x64: embedding_bag: add jit kernel for f32 sum mode` |
+| Linear history before merge | Rebase on `main` before each PR |
+
+### 3.3 Library-functionality criteria checklist (CONTRIBUTING.md)
+
+This RFC explicitly addresses each gate that CONTRIBUTING.md sets for a new primitive:
+
+- **Performance** &mdash; demonstrated via benchdnn perf runs vs. reference and vs. framework baselines on representative DLRM shapes; reported in the implementation PR cover letter.
+- **Generality** &mdash; consumer-side compatibility verified by mapping to PyTorch `nn.EmbeddingBag`, TensorFlow `embedding_lookup_sparse`, ONNX Runtime embedding paths (see §1).
+- **Complexity** &mdash; non-trivial to implement in user code: variable-bag reduction, ISA-aware vectorization, int32/int64 index handling, padding-idx skipping, optional per-sample weights, BF16/FP16 paths.
+- **Tested** &mdash; gtests for API + correctness; benchdnn `embedding_bag` driver; CI harness `test_embedding_bag_ci`; `ONEDNN_TEST_SET=NIGHTLY` validated before submit.
+- **Documented** &mdash; Doxygen comments in public headers; markdown user guide at `doc/primitives/embedding_bag.md`.
+- **Portable** &mdash; builds on every supported OS/compiler; ref impl is portable C++; the JIT impl is gated on `DNNL_X64`.
 
 ## 4. Operation Definition
 
@@ -269,7 +307,7 @@ Performed in `embedding_bag_desc_init` and `embedding_bag_pd_t::init_*`:
 
 ### 6.1 Source layout (additions only)
 
-The new files mirror the existing layout exactly. Modifications are minimal touches in already-existing dispatch / whitelist files; everything else is greenfield additions inside per-primitive directories.
+All additions live in the same directories as their analogous `softmax` / `reduction` counterparts &mdash; the optimized kernel is a regular `src/cpu/x64/` JIT primitive, not a wrapper around an external library.
 
 ```
 include/oneapi/dnnl/
@@ -280,24 +318,26 @@ include/oneapi/dnnl/
 src/common/
   opdesc.hpp                                [+] embedding_bag_desc_t
   embedding_bag.cpp                         [+] desc_init + C API entry point
-  embedding_bag_pd.hpp                      [+] primitive_desc base class
+  embedding_bag_pd.hpp                      [+] primitive-desc base class
   c_types_map.hpp                           [+] enum mirrors
   primitive_desc_iface.cpp                  [+] add to known_primitive_kind whitelist
 
 src/cpu/
   cpu_engine.hpp                            [+] DECLARE_IMPL_LIST + CASE
+  cpu_embedding_bag_pd.hpp                  [+] thin CPU PD typedef (mirrors cpu_softmax_pd.hpp)
   cpu_embedding_bag_list.cpp                [+] impl_list registration
   ref_embedding_bag.hpp                     [+] reference implementation
   ref_embedding_bag.cpp                     [+]
-  x64/zendnn/                               [+] new dir for ZenDNN-backed impls
-    zendnn_embedding_bag.hpp                [+]
-    zendnn_embedding_bag.cpp                [+]
+  x64/jit_uni_embedding_bag.hpp             [+] optimized JIT primitive (forward decl + pd_t)
+  x64/jit_uni_embedding_bag.cpp             [+] Xbyak kernels + ISA dispatch + execute()
+  # If kernels grow large enough that the .cpp exceeds ~1500 lines we will split into
+  # x64/jit_uni_embedding_bag_kernel.{hpp,cpp} following the jit_uni_reduction layout.
 
 src/gpu/
-  gpu_impl_list.cpp                         [+] CASE returns empty_list
+  gpu_impl_list.cpp                         [+] CASE returns empty_list (no GPU impl in Phase 1)
 
 tests/
-  benchdnn/embedding_bag/                   [+] driver
+  benchdnn/embedding_bag/                   [+] driver (5 files: bench_*, *.{hpp,cpp}, *_aux, ref_*)
   benchdnn/inputs/embedding_bag/            [+] test harness files
   benchdnn/doc/driver_embedding_bag.md      [+] driver doc
   benchdnn.cpp                              [+] dispatch for --embedding-bag
@@ -307,33 +347,67 @@ examples/primitives/embedding_bag.cpp       [+] tutorial example
 doc/primitives/embedding_bag.md             [+] user-guide markdown
 ```
 
+**No new CMake options.** No `ONEDNN_ENABLE_*` flag is introduced; the optimized kernel is part of the regular x64 build (gated by the existing `DNNL_X64` macro via `CPU_INSTANCE_X64`).
+
 ### 6.2 Primitive descriptor base
 
 `src/common/embedding_bag_pd.hpp` defines `embedding_bag_pd_t : public primitive_desc_t` with:
 
-- Field accessors `src_md(0)`, `src_md(1)` (indices), `src_md(2)` (offsets), `weights_md(0)`, `dst_md(0)`.
-- `arg_usage(int arg)` returning input/output for each `DNNL_ARG_*`.
-- `arg_md(int arg)` mapping to the right MD (see `reduction_pd_t::arg_md` for the pattern).
-- Helpers: `desc()->alg_kind`, `desc()->padding_idx`, `desc()->flags`, `is_lookup()`, `has_offsets()`, `has_weights()`.
+- MD accessors: `src_md(0)` (table), `src_md(1)` (indices), `src_md(2)` (offsets), `weights_md(0)`, `dst_md(0)`.
+- `arg_usage(int arg)` &rarr; input / output per `DNNL_ARG_*` (mirrors `reduction_pd_t::arg_usage`).
+- `arg_md(int arg)` &rarr; the right MD (mirrors `reduction_pd_t::arg_md`).
+- Helpers: `is_lookup()`, `has_offsets()`, `has_weights()`, `padding_idx()`, `flags()`, `D()` (= embedding dim).
+
+`src/cpu/cpu_embedding_bag_pd.hpp` is a thin CPU-side typedef that mirrors `src/cpu/cpu_softmax_pd.hpp`. CPU impls inherit `pd_t : public cpu_embedding_bag_pd_t` and use `DECLARE_COMMON_PD_T(...)` from `src/common/primitive_desc.hpp` for the standard `clone()` / `create_primitive()` / `name()` boilerplate.
 
 ### 6.3 Reference implementation
 
-`src/cpu/ref_embedding_bag.{hpp,cpp}` — `ref_embedding_bag_t : public primitive_t`, single fwd template parameterized over alg_kind. Body uses `parallel_nd(B, ...)` from `src/common/dnnl_thread.hpp` to parallelize across bags. Always present, used as ground truth in benchdnn `--engine=cpu --skip-impl=ref` exclusion logic.
+`src/cpu/ref_embedding_bag.{hpp,cpp}` &mdash; `ref_embedding_bag_t : public primitive_t`. Forward only; algorithm is read from `pd()->desc()->alg_kind` at execute time so a single class covers all four modes. Parallelism is via `parallel_nd(B, ...)` (or `parallel_nd(N, ...)` for lookup) from `src/common/dnnl_thread.hpp`. Always present; benchdnn uses it as the correctness oracle.
 
-### 6.4 ZenDNN-backed implementation
+`pd_t::init()` skeleton:
 
-`src/cpu/x64/zendnn/zendnn_embedding_bag_t` is a thin adapter:
+```cpp
+status_t init(engine_t *engine) {
+    using namespace data_type;
+    VDISPATCH_EMBEDDING_BAG(utils::one_of(src_md(0)->data_type, f32, bf16, f16),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_EMBEDDING_BAG(utils::one_of(src_md(1)->data_type, s32, s64),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_EMBEDDING_BAG(set_default_formats() == status::success,
+            VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_EMBEDDING_BAG(attr()->has_default_values(),
+            VERBOSE_UNSUPPORTED_ATTR);
+    return status::success;
+}
+```
 
-- `init()` checks ISA (AVX-512 for `f32`/`bf16`, AVX-512-FP16 for `f16`) and rejects unsupported configurations.
-- `execute()`:
-  - Reads memory arguments via `CTX_IN_MEM` / `CTX_OUT_MEM`.
-  - Builds a ZenDNN `embag_params_t` from the PD (see Appendix A for field-by-field mapping).
-  - Calls `zendnnl::lowoha::embag::embedding_bag_direct(...)` (or `embedding_direct(...)` for lookup mode).
-  - Returns `status::success` / `status::unimplemented` based on the ZenDNN return code.
+The `VDISPATCH_EMBEDDING_BAG` macro is a new entry mirroring `VDISPATCH_SOFTMAX` in `src/common/softmax_pd.hpp` &mdash; it returns `status::unimplemented` with a verbose-mode message on mismatch.
 
-The `group_embedding_bag_direct` ZenDNN entry point is **not** wrapped at the primitive level. oneDNN users invoke a single primitive per call; framework integration code that wants to amortize launch overhead can build a small adapter on top (see §12.B).
+### 6.4 Optimized x64 JIT implementation
 
-Build-time gating: the new `src/cpu/x64/zendnn/` directory and its registration in `cpu_embedding_bag_list.cpp` are guarded by an existing or new CMake option (e.g. `ONEDNN_ENABLE_ZENDNN`). When disabled, only `ref_embedding_bag_t` is in the list.
+`src/cpu/x64/jit_uni_embedding_bag_t : public primitive_t` mirrors `jit_uni_softmax_fwd_t` exactly:
+
+- **PD declaration.**
+  ```cpp
+  struct jit_uni_embedding_bag_t : public primitive_t {
+      struct pd_t : public cpu_embedding_bag_pd_t {
+          using cpu_embedding_bag_pd_t::cpu_embedding_bag_pd_t;
+          DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit:", isa_, ""),
+                  jit_uni_embedding_bag_t);
+
+          status_t init(engine_t *engine);
+
+          cpu_isa_t isa_ = isa_undef;
+          int nthr_ = 1;
+      };
+      // ...
+  };
+  ```
+- **PD `init()`.** Walks an ordered list of supported ISAs (`avx512_core_fp16`, `avx512_core_bf16`, `avx512_core`, `avx2`) and picks the first that satisfies `mayiuse(isa_) && layout_check(...)`; sets `isa_` once at PD time so `execute()` is dispatch-free. Validates dtypes per algorithm, format kinds, attributes, calls `set_default_formats()`. Books any required scratchpad (see §6.7). Returns `status::success` on match, `status::unimplemented` (via `VDISPATCH_EMBEDDING_BAG`) otherwise &mdash; the impl iterator (`src/common/primitive_desc_iterator.hpp`) advances to the next entry.
+- **Kernel.** `jit_uni_embedding_bag_kernel_t<cpu_isa_t isa>` is an Xbyak generator (`public jit_generator_t`) templated on `isa`, so `Vmm` and `simd_w` come from `cpu_isa_traits_t<isa>`. `generate()` lays out: `preamble()` &rarr; `compute_predefined_variables()` &rarr; per-row vectorized inner loop (`Xbyak::Label` based) &rarr; `postamble()`. A non-template factory `jit_uni_embedding_bag_kernel_t::create(pd, isa)` instantiates the right specialization, gated by `REG_AVX512_ISA` / `REG_AVX2_ISA` (same shape as `jit_softmax_kernel_base_t::create` in `src/cpu/x64/jit_uni_softmax.cpp` lines 1639&ndash;1656).
+- **JIT compile.** `jit_uni_embedding_bag_t::init(engine_t *)` calls `safe_ptr_assign(ker_, kernel_t::create(pd(), pd()->isa_))` and then `ker_->create_kernel()`. The kernel is compiled **exactly once per primitive instance** and reused on every `execute()`.
+- **`execute()`.** Pulls memory via `CTX_IN_MEM` / `CTX_OUT_MEM`, gets the scratchpad grantor, fans out via `parallel_nd_ext(nthr, B, ...)` (or `(nthr, N, ...)` for lookup), and invokes the JIT kernel through a small POD `call_params_t` (table-row pointer, indices slice pointer, offset value, weights pointer or null, dst row pointer, bag length, flags bits). No memory is allocated and no kernels are recompiled in this path.
+- **No external dependencies.** No header from ZenDNN, no link-time dep, no runtime call. Everything lives under `src/cpu/x64/` and is part of the regular x64 build.
 
 ### 6.5 Dispatch
 
@@ -344,30 +418,41 @@ namespace dnnl::impl::cpu {
 const impl_list_item_t *get_embedding_bag_impl_list(
         const embedding_bag_desc_t *desc) {
     UNUSED(desc);
-    constexpr impl_list_item_t impl_list[] = REG_EMBEDDING_BAG_P({
-        CPU_INSTANCE_X64(zendnn_embedding_bag_t)   // gated by ZENDNN
+    static constexpr impl_list_item_t impl_list[] = REG_EMBEDDING_BAG_P({
+        CPU_INSTANCE_X64(jit_uni_embedding_bag_t)
         CPU_INSTANCE(ref_embedding_bag_t)
         nullptr,
     });
     return impl_list;
 }
-} // namespace
+} // namespace dnnl::impl::cpu
 ```
 
-`src/cpu/cpu_engine.hpp`:
+`src/cpu/cpu_engine.hpp` adds `DECLARE_IMPL_LIST(embedding_bag);` and a `CASE(embedding_bag);` arm in the dispatch switch. `REG_EMBEDDING_BAG_P` is a new macro added to `src/common/impl_registration.hpp` mirroring `REG_SOFTMAX_P` / `REG_REDUCTION_P`.
 
-```cpp
-DECLARE_IMPL_LIST(embedding_bag);
-
-// inside switch in get_implementation_list():
-CASE(embedding_bag);
-```
+`primitive_desc_iterator_t::operator++` (`src/common/primitive_desc_iterator.hpp` lines 83&ndash;91) walks the list and skips entries whose `init()` returns `status::unimplemented` &mdash; the JIT impl rejects unsupported ISA / dtype combos in PD `init()`, and the iterator falls through to `ref_embedding_bag_t` automatically.
 
 ### 6.6 Threading
 
-All threading happens inside `execute()` via oneDNN's standard `parallel_nd` / `parallel_nd_ext` (OMP / TBB / threadpool selected at build time). The ZenDNN-backed implementation uses ZenDNN's internal threading inside `embedding_bag_direct`; it must respect the calling thread limit via `dnnl_get_max_threads()` and ZenDNN's `thread_guard` (already done inside ZenDNN's API).
+All threading uses oneDNN's standard helpers in `src/common/dnnl_thread.hpp`:
 
-oneDNN does **not** expose `eb_thread_algo_t` or `embag_kernel_t` to users. Internally, the ZenDNN adapter may consult ZenDNN environment variables (`ZENDNNL_EMBAG_ALGO`, `ZENDNNL_EMBAG_THREAD_ALGO`) for tuning, but this is invisible to the oneDNN API.
+- **Bag modes** (`sum`/`mean`/`max`): `parallel_nd_ext(nthr, B, [&](int ithr, int nthr_, dim_t b) { ... })`. Each thread handles a contiguous slice of bags; per-thread scratch (if any) is indexed by `ithr` exactly like `jit_uni_softmax_fwd_t::execute` does for its f32 intermediate buffer.
+- **Lookup mode** (`embedding_lookup`): `parallel_nd(N, [&](dim_t n) { ... })`. One row per work item.
+- **Optional inner split** (future): for very long bags relative to thread count, the kernel can split a single bag across threads using `balance211(bag_len, nthr, tid, n_start, n_end)`. Not required for Phase 1.
+
+There are no per-primitive threading knobs in the public API. Internal threading respects `dnnl_get_max_threads()` and the active runtime (OpenMP / TBB / threadpool), following the same model as every other oneDNN primitive.
+
+### 6.7 Performance considerations
+
+The design deliberately avoids unnecessary layers in the hot path. Specifically:
+
+- **Validation is done once, in PD `init()`.** No re-validation in `execute()`. ISA selection (`pd()->isa_`), scratchpad sizing, format defaults are all resolved at PD time.
+- **JIT is compiled once.** `ker_` is built in `primitive_t::init()` (via `create_kernel()`) and reused across all subsequent `execute()` calls. Cached automatically by oneDNN's primitive cache.
+- **`execute()` does not allocate.** Per-thread scratch is pre-booked with `scratchpad_registry().registrar().book(...)` in PD `init()` and consumed via `ctx.get_scratchpad_grantor().get<T>(key)`. No `std::vector` growth, no `new`/`make_unique` on the hot path.
+- **No vendor / external indirection.** The JIT kernel is a direct function-pointer call; there is no adapter, shim, or library boundary between `execute()` and the generated machine code. ZenDNN's tunables (`embag_kernel_t`, `eb_thread_algo_t`, `ZENDNNL_EMBAG_*` env vars) collapse into a single, fixed dispatch path chosen at PD time.
+- **Branch-light inner loop.** Per-sample-weight handling and `padding_idx` skipping are folded into the kernel body via separate code paths emitted at JIT time when those features are active &mdash; no conditional branch inside the SIMD reduction loop when they are disabled.
+- **Scratchpad opt-in.** The kernel needs scratch only when (a) the output dtype is bf16/f16 and we want f32 accumulation, or (b) post-ops require an intermediate buffer. For pure f32 sum/mean/max with no post-ops, no scratchpad is registered.
+- **format_kind::any for dst.** The PD lets the impl pick the dst layout; the JIT impl accepts plain (`ab`) layouts and the ref impl accepts both plain and blocked. Indices/offsets are forced to plain 1D &mdash; there is no benefit to letting the user request other layouts for them.
 
 ## 7. Data Type Support Matrix
 
@@ -375,10 +460,10 @@ oneDNN does **not** expose `eb_thread_algo_t` or `embag_kernel_t` to users. Inte
 
 | Phase | Table dtype | Dst dtype | Algorithms | Engine | Notes |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `f32` | `f32` | sum, mean, max, lookup | CPU (ref + ZenDNN) | Baseline. Must work on every supported ISA. |
-| 2 | `bf16` | `bf16` | sum, mean, max, lookup | CPU (ref + ZenDNN) | ZenDNN dispatches AVX-512 BF16 path. |
-| 2 | `f16` | `f16` | sum, mean, max, lookup | CPU (ref + ZenDNN) | Requires AVX-512-FP16 in ZenDNN; ref always works. |
-| 3 | `s8`, `s4`, `u4` | `f32` | sum, mean, lookup | CPU (ZenDNN) | Quantized table; uses `attr.scales`. |
+| 1 | `f32` | `f32` | sum, mean, max, lookup | CPU (ref + JIT x64) | Baseline. JIT lights up on `avx2` / `avx512_core`; ref covers everything else. |
+| 2 | `bf16` | `bf16` | sum, mean, max, lookup | CPU (ref + JIT x64) | JIT requires `avx512_core_bf16`; ref always works. |
+| 2 | `f16` | `f16` | sum, mean, max, lookup | CPU (ref + JIT x64) | JIT requires `avx512_core_fp16`; ref always works. |
+| 3 | `s8`, `s4`, `u4` | `f32` | sum, mean, lookup | CPU (JIT x64) | Quantized table; uses `attr.scales` / `attr.zero_points`. |
 | Future | f32/bf16/f16 | f32 (acc) | sum, mean, max | GPU (Intel SYCL) | Not in this RFC. |
 
 ## 8. Testing Strategy
@@ -440,16 +525,18 @@ A short sentence in the developer guide TOC links the new page.
 
 ## 10. Phasing and Delivery
 
-Each phase ends with a green CI on the AMD-Zenai/oneDNN-ZenDNN main branch and is reviewable as a single PR series.
+Each phase ends with a green CI run and is reviewable as a self-contained PR series. Per CONTRIBUTING.md, each commit follows the `<scope>: <subscope>: <imperative summary>` format with body wrapped at 72 chars.
 
-| Phase | Scope | Done-when |
-| --- | --- | --- |
-| 1a | Public API plumbing: enums, op-desc, C and C++ entry points, whitelist, c_types_map, ref impl skeleton | A `dnnl::embedding_bag` PD can be created and executed for `f32` `algorithm::embedding_bag_sum` against the ref impl. |
-| 1b | Reference impl complete for all 4 algorithms; padding_idx; include_last_offset; per-sample weights; primitive_attr scratchpad | benchdnn driver passes `shapes_basic`. |
-| 1c | benchdnn driver wired up; gtests; example; doc/primitives/embedding_bag.md | All new tests run in `make test` and CI. |
-| 2 | ZenDNN-backed CPU impl behind `ONEDNN_ENABLE_ZENDNN`; bf16 / f16 dtypes | benchdnn `shapes_dlrm` matches ref within tolerance; ZenDNN dispatch verified on AMD CPU. |
-| 3 | int8 / int4 quantized embedding tables via `attr.scales`; post-ops | Performance and accuracy match or beat the standalone ZenDNN `lowoha::embag` on representative DLRM shapes. |
-| 4 (future) | GPU implementation; backward pass for training | Out of scope for this RFC. |
+| Phase | Scope | Commit-scope examples | Done-when |
+| --- | --- | --- | --- |
+| 1a | Public API plumbing: enums, op-desc, C / C++ entry points, whitelist, `c_types_map`, ref-impl skeleton | `api: embedding_bag: ...`, `common: embedding_bag: ...` | `dnnl::embedding_bag` PD can be created and executed for `f32` `algorithm::embedding_bag_sum` against the ref impl. |
+| 1b | Reference impl complete for all 4 algorithms; `padding_idx`; `include_last_offset`; per-sample weights; scratchpad attribute | `cpu: embedding_bag: ref: ...` | benchdnn driver passes `shapes_basic`. |
+| 1c | benchdnn driver; gtests; example; user-guide doc | `tests: benchdnn: embedding_bag: ...`, `doc: embedding_bag: ...` | All new tests run in CI under `ONEDNN_TEST_SET=NIGHTLY`. |
+| 2a | Optimized x64 JIT impl `jit_uni_embedding_bag_t` for `f32` (AVX2 + AVX-512) | `cpu: x64: embedding_bag: ...` | JIT impl wins dispatch over ref on AVX-512 hosts; benchdnn `shapes_dlrm` accuracy matches ref. |
+| 2b | `bf16` and `f16` paths in the JIT impl | `cpu: x64: embedding_bag: ...` | Coverage on AVX-512 BF16 and AVX-512-FP16 hosts; ref fallback verified on hosts without these ISAs. |
+| 2c | Performance validation: benchdnn perf runs vs framework baselines on representative DLRM shapes | `tests: benchdnn: embedding_bag: ...` | Measured workload-level speed-up reported in PR cover letter, satisfying CONTRIBUTING.md performance gate. |
+| 3 | `s8` / `s4` / `u4` quantized embedding tables via `attr.scales` / `attr.zero_points`; post-ops support | `cpu: x64: embedding_bag: ...`, `api: embedding_bag: ...` | Accuracy matches a reference dequantize+sum path; perf comparable to or better than equivalent paths in frameworks. |
+| 4 (future) | GPU implementation (Intel SYCL); backward pass for training | &mdash; | Out of scope for this RFC. |
 
 ## 11. Risks and Open Questions
 
@@ -470,7 +557,11 @@ Each phase ends with a green CI on the AMD-Zenai/oneDNN-ZenDNN main branch and i
 
 7. **What happens when all indices in a bag are `padding_idx`?** PyTorch returns zeros for sum/mean and sentinel `-inf`-like for max (actually defaults to 0). We should match PyTorch &mdash; document and test.
 
-8. **ZenDNN compile-time vs runtime gating.** `ONEDNN_ENABLE_ZENDNN=ON` adds a build dep on ZenDNN; runtime detection is done with ISA checks already inside ZenDNN. Need to decide whether the ZenDNN dependency is statically or dynamically linked &mdash; affects packaging.
+8. **Performance gate (CONTRIBUTING.md).** Every new oneDNN primitive must show "material workload-level impact." We need a documented benchdnn perf comparison vs. framework-native paths and ref-impl, on representative DLRM shapes, to land the PR series. Risk: if the JIT port underperforms ZenDNN's stand-alone implementation in some shape regions, we either tune further or narrow the JIT impl's accept criteria so ref handles those cases.
+
+9. **Keeping ref and JIT in sync.** The reference and JIT implementations must produce bit-equal results (within fp tolerance) for all shapes / dtypes / algorithms. We mitigate by making benchdnn run both impls (`--skip-impl=ref` and not) on every change, with explicit cross-check in CI.
+
+10. **Indices dtype fan-out in the JIT.** Supporting both `s32` and `s64` doubles the kernel-instantiation surface. We plan one templated kernel parameterized on indices dtype, instantiated only for the `(isa, indices_dt)` pairs the impl list registers. Risk: combinatorial growth if more dtypes are added; will be revisited in Phase 3.
 
 ## 12. Alternatives Considered
 
@@ -492,77 +583,129 @@ ZenDNN has a `group_embedding_bag_direct` API that batches multiple lookups in o
 
 **Decision:** Defer. If profiling shows real overhead from per-bag dispatch, revisit by either (a) extending `embedding_bag` to accept a "group" dimension, or (b) adding a separate `group_embedding_bag` primitive in a follow-up RFC.
 
-### C. Expose ZenDNN's kernel/thread tuning knobs in `primitive_attr`
+### C. Wrap ZenDNN as a runtime backend (rejected)
 
-ZenDNN allows the caller to pick `embag_kernel_t` (fbgemm, native, reference) and `eb_thread_algo_t` (table_threaded, ccd_threaded, hybrid_threaded, batch_threaded).
+An earlier draft of this RFC proposed compiling against ZenDNN and dispatching `embedding_bag` calls to ZenDNN's `lowoha::embag::embedding_bag_direct(...)` behind an `ONEDNN_ENABLE_ZENDNN` CMake flag.
 
-- **Pros:** Power users can tune.
-- **Cons:** Bleeds vendor-specific concerns into oneDNN's public API. Locks oneDNN to ZenDNN's internal taxonomy.
+- **Pros:** Lower porting cost; reuses ZenDNN's tuning history (`embag_kernel_t`, `eb_thread_algo_t`, env-var knobs) directly.
+- **Cons:** Adds a third-party runtime dep to oneDNN; bleeds vendor-specific taxonomy into the build / packaging story; couples oneDNN release cadence to ZenDNN; obscures the implementation from oneDNN reviewers, complicating future maintenance.
 
-**Decision:** Do not expose. Tuning happens via ZenDNN env vars (`ZENDNNL_EMBAG_*`) inside the ZenDNN-backed implementation, opaque to oneDNN users.
+**Decision:** Reject. The kernels are upstreamed natively into `src/cpu/x64/` and re-implemented to oneDNN's coding standards. ZenDNN remains a *reference implementation* during porting, not a runtime dependency. After Phase 2, ZenDNN does not appear anywhere in the oneDNN build, link, or runtime path.
+
+### D. One big PR vs phased PR series (chosen)
+
+**Decision:** Phased PR series per §10. CONTRIBUTING.md requires linear history, encourages splitting unrelated changes, and asks reviewers to evaluate one logical concern at a time. The phasing keeps each PR focused on a single layer (API plumbing &rarr; ref impl &rarr; tests &rarr; JIT impl &rarr; quantization), each commit follows the project commit-message format, and each PR runs `ONEDNN_TEST_SET=NIGHTLY` before merge.
 
 ## 13. End-to-End Lifecycle (illustrative)
 
+The flow is identical to any other oneDNN primitive (`softmax`, `reduction`). No external libraries are involved &mdash; all kernel code is part of the oneDNN x64 build.
+
+### Primitive-descriptor creation (one-time, may be cached)
+
 ```
-            user code (PyTorch / TF / app)
-                         |
-                         v
-   dnnl::embedding_bag::primitive_desc(eng, sum, table, idx, off, w, dst, ...)
-                         |
-                         v   (C++ wrapper -> C entry)
-   dnnl_embedding_bag_primitive_desc_create(...)
-                         |
-                         v   (src/common/embedding_bag.cpp)
-   embedding_bag_desc_init(...) --> primitive_desc_create(...)
-                         |
-                         v   (src/common/primitive_desc_iface.cpp)
-   known_primitive_kind whitelist check
-                         |
-                         v   (src/cpu/cpu_engine.hpp - CASE(embedding_bag))
-   get_embedding_bag_impl_list(desc)
-                         |
-                         v   (src/cpu/cpu_embedding_bag_list.cpp)
-   try zendnn_embedding_bag_t::pd_t::create() ... if rejected, fall through
-   try ref_embedding_bag_t::pd_t::create()
-                         |
-                         v
-                  primitive_desc ready
-                         |
-   user: dnnl::embedding_bag prim(pd); prim.execute(stream, args);
-                         |
-                         v
-   primitive_t::execute() -> ZenDNN's lowoha::embag::embedding_bag_direct(...)
-                         OR ref_embedding_bag_t::execute_forward(...)
-                         |
-                         v
-                    dst memory written
+  user code (PyTorch / TF / ONNX RT / application)
+        |
+        v   dnnl::embedding_bag::primitive_desc(eng, alg, table_md, idx_md,
+                                                off_md, w_md, dst_md, pad, flags, attr)
+                                                    [include/oneapi/dnnl/dnnl.hpp]
+        |
+        v   C++ wrapper -> C API
+  dnnl_embedding_bag_primitive_desc_create(...)
+                                                    [include/oneapi/dnnl/dnnl.h]
+        |
+        v   build internal embedding_bag_desc_t, validate scalar params
+  embedding_bag_desc_init(...) --> primitive_desc_create(...)
+                                                    [src/common/embedding_bag.cpp]
+        |
+        v   primitive-kind whitelist check
+  known_primitive_kind contains embedding_bag ?
+                                                    [src/common/primitive_desc_iface.cpp]
+        |
+        v   engine-side dispatch
+  cpu_engine::get_*_impl_list -> CASE(embedding_bag)
+                                                    [src/cpu/cpu_engine.hpp]
+        |
+        v   ordered impl_list walked by primitive_desc_iterator_t
+  +-> jit_uni_embedding_bag_t::pd_t::init()
+  |     - mayiuse(avx512_core_*) ladder -> sets pd()->isa_
+  |     - dtype + format + attr checks via VDISPATCH_EMBEDDING_BAG
+  |     - set_default_formats(); init_scratchpad()
+  |     - status::success      ---> selected
+  |   (or status::unimplemented ---> iterator advances)
+  |                                                 [src/cpu/x64/jit_uni_embedding_bag.cpp]
+  |
+  +-> ref_embedding_bag_t::pd_t::init()  (terminal fallback)
+                                                    [src/cpu/ref_embedding_bag.cpp]
+        |
+        v
+  primitive_desc ready (with selected impl's pd_t)
 ```
 
-## Appendix A. ZenDNN-to-oneDNN Concept Mapping
+### Primitive creation (one-time, JIT compile)
 
-How each ZenDNN concept lands in oneDNN:
+```
+  user: dnnl::embedding_bag prim(pd);
+        |
+        v   primitive_t::create_primitive_common -> impl::init(engine)
+  jit_uni_embedding_bag_t::init(engine):
+      ker_ = jit_uni_embedding_bag_kernel_t::create(pd(), pd()->isa_);
+      ker_->create_kernel();        // Xbyak emit + executable mapping, cached
+                                                    [src/cpu/x64/jit_uni_embedding_bag.cpp]
+```
 
-| ZenDNN concept | oneDNN equivalent | Where it lives |
+### Execute (hot path, no allocations, no ZenDNN involvement)
+
+```
+  user: prim.execute(stream, args);
+        |
+        v
+  jit_uni_embedding_bag_t::execute(ctx):
+      table  = CTX_IN_MEM (const char *, DNNL_ARG_SRC);
+      idx    = CTX_IN_MEM (const char *, DNNL_ARG_SRC_1);
+      off    = CTX_IN_MEM (const char *, DNNL_ARG_SRC_2);     // null in lookup mode
+      w      = CTX_IN_MEM (const float *, DNNL_ARG_WEIGHTS);  // null if absent
+      dst    = CTX_OUT_MEM(char *,        DNNL_ARG_DST);
+      auto sp = ctx.get_scratchpad_grantor();                  // pre-booked, no alloc
+
+      parallel_nd_ext(nthr, B, [&](int ithr, int nthr_, dim_t b) {
+          call_params_t p { table, idx + off[b], off[b+1] - off[b],
+                            w ? w + off[b] : nullptr,
+                            dst + b * D, ithr_scratch, flags };
+          (*ker_)(&p);              // direct call into JIT-compiled code
+      });
+        |
+        v
+  dst memory written
+```
+
+The reference fallback follows the same shape but inlines a portable C++ row-reduction loop instead of the JIT call.
+
+For `algorithm::embedding_lookup` the fan-out is over `N` (number of indices) instead of `B`, the offset arithmetic disappears (each work item handles exactly one row), and `DNNL_ARG_SRC_2` is unused.
+
+## Appendix A. ZenDNN Reference &rarr; Native oneDNN Mapping
+
+ZenDNN's `lowoha::embag` source tree is the *reference implementation* used during porting. After Phase 2 lands, none of these ZenDNN names appear in oneDNN code &mdash; everything is replaced by an idiomatic oneDNN equivalent. The table below documents that translation so reviewers can cross-check the port.
+
+| ZenDNN reference | Translates to in oneDNN | Notes |
 | --- | --- | --- |
-| `embag_algo_t::sum / mean / max` | `algorithm::embedding_bag_sum / _mean / _max` | `dnnl_alg_kind_t` enum |
-| `embag_algo_t::none` (lookup) | `algorithm::embedding_lookup` | `dnnl_alg_kind_t` enum |
-| `embag_data_types_t::table` | `src_desc.data_type` | memory descriptor |
-| `embag_data_types_t::output` | `dst_desc.data_type` | memory descriptor |
-| `embag_data_types_t::indices / offsets` | `indices_desc.data_type / offsets_desc.data_type` | memory descriptor |
-| `embag_data_types_t::scale / bias` | `attr.scales` / `attr.zero_points` (Phase 3) | `primitive_attr` |
-| `embag_params_t::num_embeddings / embedding_dim` | `src_desc.dims[0]`, `src_desc.dims[1]` | memory descriptor |
-| `embag_params_t::num_indices` | `indices_desc.dims[0]` | memory descriptor |
-| `embag_params_t::num_bags` | `dst_desc.dims[0]` (bag mode) | memory descriptor |
-| `embag_params_t::is_weights` | `weights_desc.is_zero() == false` | inferred |
-| `embag_params_t::include_last_offset` | `flags & include_last_offset` | flags bitmask |
-| `embag_params_t::padding_idx` | `padding_idx` op-desc field | op descriptor |
-| `embag_params_t::dst_stride` | derived from `dst_desc.format_desc` | memory descriptor |
-| `embag_params_t::num_threads` | inherited from oneDNN's threading runtime | not exposed |
-| `embag_params_t::kernel` | hidden inside the impl list | not exposed |
-| `eb_thread_algo_t` | hidden inside the impl list | not exposed |
-| `embedding_bag_direct(...)` | called from `zendnn_embedding_bag_t::execute()` | impl |
-| `embedding_direct(...)` | called when alg_kind == lookup | impl |
-| `group_embedding_bag_direct(...)` | not wrapped at primitive level | see §12.B |
+| `embag_algo_t::sum / mean / max` | `algorithm::embedding_bag_sum / _mean / _max` | New entries in `dnnl_alg_kind_t` enum |
+| `embag_algo_t::none` (lookup) | `algorithm::embedding_lookup` | New entry in `dnnl_alg_kind_t` enum |
+| `embag_data_types_t::table` / `output` | `src_desc.data_type` / `dst_desc.data_type` | Standard oneDNN memory descriptors |
+| `embag_data_types_t::indices` / `offsets` | `indices_desc.data_type` / `offsets_desc.data_type` | Standard oneDNN memory descriptors |
+| `embag_data_types_t::scale` / `bias` | `attr.scales` / `attr.zero_points` (Phase 3) | Use existing `primitive_attr` machinery |
+| `embag_params_t::num_embeddings` / `embedding_dim` | `src_desc.dims[0]` / `src_desc.dims[1]` | Inferred from MD, no separate field |
+| `embag_params_t::num_indices` / `num_bags` | `indices_desc.dims[0]` / `dst_desc.dims[0]` | Inferred from MDs |
+| `embag_params_t::is_weights` | `!weights_desc.is_zero()` | Inferred from MD presence |
+| `embag_params_t::include_last_offset` | `flags & dnnl_embedding_bag_include_last_offset` | New flags bitmask in op-desc |
+| `embag_params_t::padding_idx` | `padding_idx` field in `embedding_bag_desc_t` | New op-desc field |
+| `embag_params_t::dst_stride` | derived from `dst_desc.format_desc` | Memory layout, not an explicit param |
+| `embag_params_t::num_threads` | `dnnl_get_max_threads()` | Owned by oneDNN's threading runtime |
+| `embag_params_t::kernel` (`fbgemm` / `native` / `reference` / ...) | impl-list ordering: `jit_uni_embedding_bag_t` then `ref_embedding_bag_t` | No public knob; PD `init()` picks the right impl |
+| `eb_thread_algo_t` (`table_threaded` / `ccd_threaded` / `hybrid_threaded` / `batch_threaded`) | `parallel_nd_ext(nthr, B, ...)` work split | One canonical strategy chosen at port time; tunable internally if profiling justifies it later |
+| `lowoha::embag::embedding_bag_direct(...)` | `jit_uni_embedding_bag_t::execute(ctx)` body | Re-implemented natively; no call through to ZenDNN |
+| `lowoha::embag::embedding_direct(...)` | same `execute(ctx)` with `alg_kind == embedding_lookup` | Single primitive class, not a separate function |
+| `lowoha::embag::group_embedding_bag_direct(...)` | not ported as a single primitive | See §12.B; deferred to a follow-up RFC if perf data justifies it |
+| ZenDNN env vars `ZENDNNL_EMBAG_ALGO`, `ZENDNNL_EMBAG_THREAD_ALGO` | none | Tuning baked into the JIT impl at port time; no env-var surface |
 
 ## Appendix B. File Touchpoints Checklist
 
@@ -585,12 +728,13 @@ For Phase 1, each PR maps to a sub-bullet here. Crossed-off when merged.
 - [ ] `src/cpu/cpu_embedding_bag_list.cpp`: impl list registration.
 - [ ] `src/cpu/ref_embedding_bag.{hpp,cpp}`: reference implementation.
 
-**ZenDNN backend (Phase 2)**
-- [ ] `src/cpu/x64/zendnn/zendnn_embedding_bag.{hpp,cpp}`.
-- [ ] CMake option `ONEDNN_ENABLE_ZENDNN`.
+**Optimized x64 JIT (Phase 2)**
+- [ ] `src/cpu/x64/jit_uni_embedding_bag.hpp`: `jit_uni_embedding_bag_t` + `pd_t` + `DECLARE_COMMON_PD_T`.
+- [ ] `src/cpu/x64/jit_uni_embedding_bag.cpp`: Xbyak kernel template, ISA dispatch factory, `init()`, `execute()`. Split into `jit_uni_embedding_bag_kernel.{hpp,cpp}` if `.cpp` exceeds ~1500 lines (mirroring `jit_uni_reduction` layout).
+- [ ] No new CMake flag; gating is via the existing `DNNL_X64` macro through `CPU_INSTANCE_X64`.
 
 **GPU (Phase 1, stub only)**
-- [ ] `src/gpu/gpu_impl_list.cpp`: `case primitive_kind::embedding_bag: return empty_list;`
+- [ ] `src/gpu/gpu_impl_list.cpp`: `case primitive_kind::embedding_bag: return empty_list;` (mirrors `sdpa` / `gated_mlp`).
 
 **Tests / docs / examples**
 - [ ] `tests/benchdnn/benchdnn.cpp`: dispatch `--embedding-bag`.
@@ -603,9 +747,31 @@ For Phase 1, each PR maps to a sub-bullet here. Crossed-off when merged.
 
 ## Appendix C. References
 
-- ZenDNN `lowoha::embag::embedding_bag_direct` &mdash; reference implementation we wrap. (See ZenDNN tree `operators/embag/` and `lowoha_operators/embag/`.)
-- oneDNN `reduction` primitive &mdash; closest existing primitive for layout / argument conventions: `src/common/reduction.cpp`, `src/common/reduction_pd.hpp`, `src/cpu/cpu_reduction_list.cpp`.
-- oneDNN `softmax` primitive &mdash; reference for forward-only PD with algorithm enum: `src/common/softmax.cpp`, `src/common/softmax_pd.hpp`, `src/cpu/cpu_softmax_list.cpp`.
-- PyTorch `nn.EmbeddingBag` &mdash; consumer semantics target.
-- FBGEMM EmbeddingBag kernels &mdash; ZenDNN's underlying optimized backend on AVX-512.
+**Project guidelines (must read before reviewing).**
+- [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) &mdash; library functionality criteria, RFC process, commit-message format, unit-test policy.
+- [`CODING_STANDARDS.md`](../../../CODING_STANDARDS.md) &mdash; clang-tidy, clang-format, naming, Xbyak conventions.
+- [`.clang-tidy`](../../../.clang-tidy) (top-level) &mdash; the enforced check list.
+- [`.clang-format`](../../../.clang-format) (top-level) &mdash; the enforced style file.
+
+**Most relevant existing primitives (patterns to mirror).**
+- `src/common/reduction.cpp`, `src/common/reduction_pd.hpp`, `src/cpu/cpu_reduction_list.cpp` &mdash; closest existing primitive for layout / argument conventions.
+- `src/common/softmax.cpp`, `src/common/softmax_pd.hpp`, `src/cpu/cpu_softmax_list.cpp` &mdash; forward-only PD with algorithm enum, scratchpad usage, ISA-dispatched JIT.
+- `src/cpu/x64/jit_uni_softmax.hpp` (398 lines) and `src/cpu/x64/jit_uni_softmax.cpp` (1856 lines) &mdash; canonical "single-file kernel" JIT primitive layout.
+- `src/cpu/x64/jit_uni_reduction.{hpp,cpp}` plus `src/cpu/x64/jit_uni_reduction_kernel.{hpp,cpp}` &mdash; canonical "split-kernel" layout for larger Xbyak generators.
+
+**Internal infrastructure used by every JIT primitive.**
+- `src/common/dnnl_thread.hpp` &mdash; `parallel_nd`, `parallel_nd_ext`, `balance211`, `nd_iterator_init`/`step`.
+- `src/common/primitive.hpp` &mdash; `CTX_IN_MEM` / `CTX_OUT_MEM` macros.
+- `src/common/primitive_desc.hpp` &mdash; `DECLARE_COMMON_PD_T` macro.
+- `src/common/primitive_desc_iterator.hpp` &mdash; impl-list walking semantics (`unimplemented` &rarr; advance).
+- `src/cpu/cpu_engine.hpp` &mdash; `CPU_INSTANCE`, `CPU_INSTANCE_X64`, `DECLARE_IMPL_LIST`, `CASE`.
+- `src/common/impl_registration.hpp` &mdash; `REG_<PRIM>_P` macros.
+
+**Source of the kernels being upstreamed.**
+- AMD ZenDNN `lowoha::embag` &mdash; `embedding_bag_direct`, `embedding_direct`, `group_embedding_bag_direct`. Used as reference during Phase 2 porting; not a runtime dependency after the contribution lands.
+
+**Consumer semantics targets.**
+- PyTorch `nn.EmbeddingBag` &mdash; primary consumer semantics target.
+- TensorFlow `tf.nn.embedding_lookup_sparse` &mdash; sum / mean / max with combiner.
+- ONNX Runtime `EmbedLayerNormalization` &mdash; inference-time embedding fast path.
 
