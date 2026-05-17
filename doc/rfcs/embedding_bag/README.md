@@ -4,7 +4,7 @@
 **Draft** &nbsp;|&nbsp; AMD-Zenai/oneDNN-ZenDNN &nbsp;|&nbsp; Branch: `rfc/zendnn-integration` &nbsp;|&nbsp; Umbrella RFC: [`doc/rfcs/zendnn_integration/`](../zendnn_integration/README.md)
 
 ## Authors
-- AMD-Zenai team
+- AMD ZenDNN team
 
 ## Summary
 This RFC proposes adding a new `embedding_bag` primitive to oneDNN, with `embedding` (lookup-only) exposed as a thin C++ wrapper over the same primitive. The design follows existing oneDNN conventions for primitives such as `softmax` and `reduction`, complies with the project [Coding Standards](../../../CODING_STANDARDS.md) and [Contributing guidelines](../../../CONTRIBUTING.md), and is compatible with PyTorch `nn.EmbeddingBag`, TensorFlow `tf.nn.embedding_lookup_sparse`, and ONNX Runtime `EmbedLayerNormalization` consumer semantics.
