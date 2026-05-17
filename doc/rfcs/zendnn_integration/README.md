@@ -20,6 +20,20 @@ A working PoC of Vertical&nbsp;1 (MatMul fp32/bf16 with Reorder) is already runn
 
 ---
 
+> ## :pushpin: First PR &mdash; the immediate ask
+>
+> Once this RFC is accepted, the **first** PR to upstream `uxlfoundation/oneDNN` carries exactly the following scope. Everything else is follow-up.
+>
+> 1. **ZenDNN library integration in build infra** &mdash; new `DNNL_ENABLE_ZENDNN` CMake option (default OFF), `find_package(ZenDNN)` plumbing, optional `DNNL_ENABLE_ZENDNN_STATIC` for link-mode control. No effect on the default build.
+> 2. **Add ZenDNN MatMul (+ fused) and Reorder (for format conversion) in the `zen64` module** &mdash; new `src/cpu/x64/zen64/{zen64_matmul,zen64_reorder}.{hpp,cpp}` registered into `cpu_matmul_list.cpp` and `cpu_reorder_list.cpp` ahead of the existing entries.
+>     - **BF16 and FP32 datatypes** &mdash; the two dtypes that cover the broadest set of LLM inference workloads today.
+>     - **Fallback to the native oneDNN kernel for non-supported features** &mdash; staged `VDISPATCH_*` checks in `pd_t::init()` (vendor / uArch / ISA / shape / dtype / layout / post-op) return `status::unimplemented` cleanly so the dispatcher falls through to `brgemm_matmul_t` / existing reorder impls. No silent failures, no compute regressions.
+>     - **Validation with AMD and Intel CPUs** &mdash; benchdnn correctness + perf evidence on a Zen host (impl selected = `zendnn:matmul:f32\|bf16:amd`) and on an Intel host with the same binary (`DNNL_ENABLE_ZENDNN=ON` build, ZenDNN code path *not* taken; existing impl runs unchanged; `--skip-impl=zendnn` rerun confirms no regression).
+>
+> Detailed acceptance criteria, file-level scope, and the surrounding milestone gates are in [§9.1](#91-first-pr--scope-and-acceptance-criteria-the-immediate-ask). Vertical&nbsp;1 follow-ups (BMM, GroupGEMM, SDPA, quantised MatMul, BRGEMM-microkernel hook) are in [§9.2](#92-follow-up-prs-vertical-1).
+
+---
+
 ## 1. Motivation
 
 oneDNN is the de-facto CPU primitive library that frameworks (PyTorch, TensorFlow, ONNX Runtime, llama.cpp via custom paths, vLLM) depend on. On Intel CPUs, oneDNN has years of dedicated optimisation. On AMD CPUs (Zen3 / Zen4 / Zen5 / Zen6), the same primitives leave performance on the table when kernel selection, memory layout, or threading choices don't match Zen-microarchitecture preferences. AMD's ZenDNN library has been the production path for closing that gap, today shipping inside zentorch and consumed by frameworks via a separate AMD-specific code path.
@@ -576,9 +590,68 @@ The two flows look intentionally similar &mdash; both end in a primitive-cache-a
 
 ## 9. Delivery Plan (Milestone Gates)
 
-The two verticals run in parallel with overlapping milestones but independent PR tracks. The plan is described as **gates** rather than dates &mdash; each gate has a concrete done-when criterion and the next gate cannot open until the previous one is closed. Each PR follows oneDNN's commit-message format `<scope>[: <subscope>...]: <imperative summary>` and runs `ONEDNN_TEST_SET=NIGHTLY` before merge, per [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
+The two verticals run in parallel with independent PR tracks. The plan is described as **gates** rather than dates &mdash; each gate has a concrete done-when criterion and the next gate cannot open until the previous one is closed. Each PR follows oneDNN's commit-message format `<scope>[: <subscope>...]: <imperative summary>` and runs `ONEDNN_TEST_SET=NIGHTLY` before merge, per [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). The First PR (§9.1) is the immediate ask of this RFC; the surrounding gates (§9.3) and the Vertical&nbsp;2 work (§9.4) are tracked here for context.
 
-### 9.1 Vertical 1 (`zen64` module) gates
+### 9.1 First PR &mdash; scope and acceptance criteria (the immediate ask)
+
+The first PR upstreamed under this RFC delivers exactly the four items below. Each line is a checkable acceptance criterion that must be green for the PR to merge.
+
+#### 9.1.1 ZenDNN library integration in build infra
+
+- New CMake option `DNNL_ENABLE_ZENDNN` &mdash; default `OFF` so the standard build is byte-identical to today's oneDNN. Documented in `doc/build/build_options.md`.
+- Optional companion option `DNNL_ENABLE_ZENDNN_STATIC` &mdash; default `OFF` (dynamic link); flip to static for embedded / single-binary deployments. Both options are user-facing and validated in CI.
+- New `cmake/FindZenDNN.cmake` module so `find_package(ZenDNN)` resolves a system-installed or vendored ZenDNN; ZenDNN version pinned to a known-good commit range with a clear error message on mismatch.
+- Build matrix gated to Linux x86_64 only when the option is `ON`; macOS / Windows / Arm fail fast at configure time with an explanatory error rather than producing a half-built tree.
+- **Done-when:** clean configure + build of `cmake -DDNNL_ENABLE_ZENDNN=ON` and `cmake -DDNNL_ENABLE_ZENDNN=OFF` on the supported toolchains; the OFF build's binary `libdnnl.so` is byte-identical to today's oneDNN.
+
+#### 9.1.2 Add ZenDNN MatMul (+ fused) and Reorder (format-conversion) in the `zen64` module
+
+- New `src/cpu/x64/zen64/` directory with the file layout from §5.9 (common helpers, status / MD translation, per-primitive adapter classes).
+- New `zen64::matmul_t` registered in `src/cpu/matmul/cpu_matmul_list.cpp` ahead of the existing entries via `DNNL_X64_ONLY_IF(DNNL_ENABLE_ZENDNN, CPU_INSTANCE(zen64::matmul_t))`.
+- New `zen64::reorder_t` registered in `src/cpu/reorder/cpu_reorder_list.cpp` covering the format-conversion cases ZenDNN's MatMul prefers (input layout &rarr; ZenDNN-blocked weights). Enables Strategy B (ahead-of-time reorder) so frameworks can prepack outside the inference loop.
+- Standard fused MatMul post-ops supported (bias add, eltwise, simple binary on the result) at parity with `brgemm_matmul_t`; combinations ZenDNN cannot serve are rejected in `pd_t::init()` and the existing impl runs.
+- **Done-when:** `dnnl::matmul` for the supported dtypes / layouts / post-ops on a Zen host shows `zendnn:matmul:f32\|bf16:amd` as the impl in `onednn_verbose`; `dnnl::reorder` for the format-conversion cases shows `zendnn:reorder:...:amd`.
+
+#### 9.1.3 BF16 and FP32 datatypes
+
+- BF16 path: src / wei / dst all BF16; bias optional FP32 per oneDNN convention; activation accumulator FP32 internal to ZenDNN.
+- FP32 path: src / wei / dst all FP32; bias optional FP32.
+- Both dtypes covered by benchdnn correctness sweeps against `brgemm_matmul_t` within oneDNN's standard tolerance per dtype.
+- Other dtypes (FP16, INT8, INT4, etc.) explicitly out of scope for this PR &mdash; `pd_t::init()` rejects them so the existing impl handles those cases unchanged. They are picked up in §9.2.
+- **Done-when:** benchdnn diff vs. `--skip-impl=zendnn` is within tolerance on the published BF16 and FP32 shape sets; verbose log confirms `zen64` is the impl reached on the supported dtypes only.
+
+#### 9.1.4 Fallback to the native oneDNN kernel for non-supported features
+
+- Staged `VDISPATCH_*` checks in `zen64::matmul_t::pd_t::init()` (§5.5) cover: runtime kill-switch &rarr; vendor / uArch / ISA &rarr; shape / dtype / layout / post-op / attribute &rarr; format-default + scratchpad. The first failing stage returns `status::unimplemented` with a verbose-mode reason string.
+- `primitive_desc_iterator_t::operator++` advances on `unimplemented`, so any unsupported configuration silently exercises the existing oneDNN impl. **No silent failures, no compute regressions.**
+- A targeted dispatch-test set (part of this PR) forces unsupported configurations and asserts the next entry runs.
+- **Done-when:** the dispatch-test set passes; running the same binary with `DNNL_ENABLE_ZENDNN=0` (runtime kill-switch) on the same Zen host produces verbose logs identical to a build with `DNNL_ENABLE_ZENDNN=OFF`.
+
+#### 9.1.5 Validation with AMD and Intel CPUs
+
+- **AMD validation.** benchdnn correctness + perf sweeps on a Zen-class host with the build flag ON, asserting `zen64` is the selected impl on supported configurations and reporting per-shape speed-up vs `brgemm_matmul_t`.
+- **Intel validation (no regression gate).** Same binary on an Intel host: benchdnn full sweep with `DNNL_ENABLE_ZENDNN=ON` must produce identical impl selection (`brgemm_matmul_t` etc.) and identical results to a `DNNL_ENABLE_ZENDNN=OFF` build. This is a hard merge gate.
+- **Model-level validation.** vLLM running BF16 / FP32 inference on a representative LLM set; candidate = `vLLM + oneDNN(zen64 enabled)`, baseline = `vLLM + zentorch` (existing AMD path) and `vLLM + stock oneDNN` (current Intel-tuned path).
+- **CI matrix update.** Add a Zen-host CI lane and an Intel-host-with-flag-on lane to the upstream CI; both must be green before merge.
+- **Done-when:** all three validation reports are attached to the PR cover letter; the CI matrix update lands in the same PR; reviewers can see the impl name in every verbose log line attached to the perf evidence.
+
+### 9.2 Follow-up PRs (Vertical 1)
+
+After the First PR lands, Vertical&nbsp;1 continues with one PR per area below, each carrying its own RFC delta or scoped design note. None of these are part of the First PR's review surface.
+
+- **Quantization support** &mdash; Weight-only Quantization (WoQ), Static Quant (per-tensor / per-channel), Dynamic Quant. The static / WoQ paths use oneDNN's existing `attr.scales` / `attr.zero_points`. The Dynamic Quant path depends on the Vertical&nbsp;2 Dynamic-Quant API extension landing first.
+- **Other operator support** &mdash; one PR per operator:
+    - **BMM** &mdash; the batched MatMul path (uses oneDNN's `matmul` with a batch dim today; ZenDNN registers a separate impl entry for the batched dispatch).
+    - **GroupGEMM** &mdash; through ZenDNN's Grouped Memory Format for variable-size batching (no padding overhead).
+    - **SDPA** &mdash; the existing `dnnl_sdpa` primitive, with ZenDNN's AMD-tuned attention dispatch.
+    - **Reorder (Quant / DeQuant)** &mdash; quant / dequant variants of the format-conversion path opened in the First PR (§9.1.2).
+- **ZenDNN LOWOHA integration in BRGEMM microkernel** &mdash; opens a low-overhead path through oneDNN's BRGEMM microkernel API, paired with the Vertical&nbsp;2 LOWOHA hook (§7).
+
+Each follow-up PR is its own design note + impl + benchdnn perf + model-level evidence, reviewed independently.
+
+### 9.3 Vertical 1 milestone gates (context for the First PR)
+
+The First PR sits in the middle of a longer chain of milestones. The full set is tracked here so reviewers can see what came before and what's planned after.
 
 | Gate | Scope | Done-when |
 |---|---|---|
@@ -586,12 +659,12 @@ The two verticals run in parallel with overlapping milestones but independent PR
 | **G1.2 &mdash; Reorder Strategy B** *(in progress)* | oneDNN-side reorder ahead of time, then ZenDNN MatMul on already-packed weights | Strategy B variant working on the same shapes G1.1 covers, with measurable amortisation on warm-cache runs |
 | **G1.3 &mdash; vLLM framework validation** *(in progress)* | `vLLM + oneDNN(zen64 enabled)` on production-relevant LLM workloads; baseline = `vLLM + zentorch` | Quantified perf lift on a wide model set on AMD hosts; **no regression on Intel hosts** |
 | **G1.4 &mdash; Upstream RFC alignment** | This document submitted to `uxlfoundation/oneDNN` `rfcs` branch alongside the companion RFC | Formal sign-off from oneDNN maintainers on the build option, dispatch mechanism, fallback semantics, and reorder strategy |
-| **G1.5 &mdash; First PR** | ZenDNN library build-infra integration; `zen64::matmul_t` (+ fused) + `zen64::reorder_t`; BF16 + FP32; native oneDNN fallback for unsupported features; AMD + Intel CPU validation | benchdnn correctness + perf evidence in PR cover letter; no regression on Intel; CI green on `uxlfoundation/oneDNN` `main` |
-| **G1.6 &mdash; Follow-up: Quantized MatMul** | WoQ + Static via existing `attr.scales` / `attr.zero_points`; Dynamic Quant integration with the V2 Dynamic-Quant primitive | Quantized inference path validated end-to-end |
-| **G1.7 &mdash; Follow-up: Other operators** | BMM, GroupGEMM (Grouped Memory Format for variable-size batching), SDPA, Reorder (Quant/DeQuant) | Each operator is a separate PR with its own benchdnn evidence |
+| **G1.5 &mdash; First PR** | The exact scope spelled out in §9.1 | All §9.1 done-when criteria green; CI green on `uxlfoundation/oneDNN` `main` |
+| **G1.6 &mdash; Follow-up: Quantized MatMul** | WoQ + Static via `attr.scales` / `attr.zero_points`; Dynamic Quant integration with the V2 Dynamic-Quant primitive | Quantized inference path validated end-to-end |
+| **G1.7 &mdash; Follow-up: Other operators** | BMM, GroupGEMM, SDPA, Reorder (Quant/DeQuant) per §9.2 | Each operator is a separate PR with its own benchdnn evidence |
 | **G1.8 &mdash; Follow-up: BRGEMM microkernel hook** | ZenDNN LOWOHA integration in oneDNN's BRGEMM microkernel API path | Small-shape GEMM-heavy workloads (SDPA, low-batch decode) show measurable improvement |
 
-### 9.2 Vertical 2 milestones (per companion RFC)
+### 9.4 Vertical 2 milestones (per companion RFC)
 
 Vertical&nbsp;2 items are scoped, planned, and delivered through their own per-item RFCs. This umbrella RFC tracks only the umbrella commitment that each item ships:
 
