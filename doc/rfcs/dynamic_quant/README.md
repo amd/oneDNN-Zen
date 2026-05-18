@@ -12,7 +12,7 @@ This RFC proposes adding a new `dynamic_quantize` primitive to oneDNN. The primi
 
 oneDNN today only supports *static* quantization: the user provides scales and zero-points (via `attr.scales` / `attr.zero_points`) and the library applies them. There is no primitive that can derive scales / zero-points from input data at inference time. This is the core operation behind dynamic-quantised LLM inference (activation quantisation per token, per row, or per group of rows / cols), and it is the missing primitive that frameworks have to implement on top of oneDNN today &mdash; via two memory passes and a separate reduction kernel &mdash; instead of asking oneDNN for it.
 
-The kernels for this contribution come from AMD ZenDNN's existing reorder-API surface, where dynamic quantisation already ships with all the required granularities and is in production use through `zentorch`. As with the companion `embedding_bag` RFC, this RFC proposes upstreaming the kernels **natively** into oneDNN's `src/cpu/x64/` tree as **AVX-512 intrinsics** &mdash; no Xbyak, no JIT, no link-time or runtime dependency on ZenDNN. A portable reference implementation under `src/cpu/` is always available.
+The contribution lands **directly inside oneDNN** &mdash; new sources under `src/cpu/x64/` and `src/cpu/`, written in plain C++ with **AVX-512 / AVX-512-FP16 intrinsics**. **No Xbyak. No JIT. No link-time, runtime, or build-time dependency on ZenDNN.** ZenDNN's existing reorder-API dynamic-quant code is used as a reference while porting (see Appendix A) and is then out of the picture; once the primitive lands in oneDNN, every consumer (frameworks, applications) gets it from oneDNN alone. A portable reference implementation under `src/cpu/` is always available as the correctness fallback.
 
 A standalone primitive is the right shape for this operation in oneDNN because it has multiple outputs (quantised dst + computed scale + optional zero-point) and a compute-only mode (compute scale / zp without writing the quantised dst), neither of which fits cleanly under the existing `reorder` primitive's single-output, parametric-scales model.
 
@@ -76,7 +76,7 @@ oneDNN already has the right precedent for this exact shape of operation: **`bat
 - All five granularities in scope: **per-tensor**, **per-row**, **per-col**, **per-group-row**, **per-group-col**, expressed via the shape of the scale/zp memory descriptors.
 - Compute-only mode (skip dst, only emit scale/zp) selectable via a flag.
 - Source dtypes: `f32`, `bf16` (Phase 1). Destination dtypes: `s8` (symmetric), `u8` (asymmetric). Scale dtype: `f32` (Phase 1; `bf16` Phase 2).
-- AVX-512 / AVX-512-FP16 intrinsic kernel native to oneDNN; no Xbyak / no JIT (consistent with the `embedding_bag` companion RFC).
+- AVX-512 / AVX-512-FP16 intrinsic kernel native to oneDNN; **no Xbyak, no JIT, no runtime dependency on ZenDNN** (rationale in §5.4).
 - benchdnn driver, gtest coverage, example, user-guide doc.
 
 ### Non-Goals (initial release)
@@ -348,7 +348,7 @@ examples/primitives/dynamic_quantize.cpp    [+] tutorial example
 doc/primitives/dynamic_quantize.md          [+] user-guide markdown
 ```
 
-The optimised file is `src/cpu/x64/dynamic_quantize.{hpp,cpp}` &mdash; **no `jit_` prefix**, consistent with the `embedding_bag` companion RFC's choice of intrinsics over JIT.
+The optimised file is `src/cpu/x64/dynamic_quantize.{hpp,cpp}` &mdash; **no `jit_` prefix** because the implementation is AVX-512 intrinsics, not Xbyak JIT. Rationale for the intrinsics-over-JIT choice is in §5.4.
 
 ### 5.2 Primitive descriptor base
 
@@ -386,7 +386,7 @@ status_t init(engine_t *engine) {
 
 ### 5.4 Optimised x64 implementation (AVX-512 intrinsics)
 
-This is intentionally not a JIT primitive. Same rationale as the `embedding_bag` companion RFC: the kernel logic (min/max reduction over a group, then a scale/zp computation, then a saturating-cast quantise loop) is structurally simple, has no shape-dependent code-gen opportunity that benefits from Xbyak's runtime emission, and ZenDNN's existing intrinsic implementation is well-validated and ships today. Porting as intrinsics preserves that validation surface and keeps the diff readable for upstream reviewers. A future JIT impl can be slotted above the intrinsic one in the impl list if profiling ever justifies it (no API change).
+This is intentionally **not** a JIT primitive. The kernel logic &mdash; min/max reduction over a group, scale / zero-point computation, saturating-cast quantise loop &mdash; is structurally simple and has **no shape-dependent code-gen opportunity** that would benefit from Xbyak's runtime emission. The whole inner loop can be expressed as ordinary AVX-512 intrinsics that the C++ compiler emits at oneDNN build time; using JIT here would add infrastructure (executable mappings, primitive-instance JIT compile step) without any measurable performance return. Writing it as intrinsics keeps the diff small and readable for upstream reviewers, who can read the kernel as plain C++ rather than as Xbyak emit calls. The impl list keeps the door open for a future Xbyak JIT impl above the intrinsic one if benchmarking ever shows it would win on a meaningful set of shapes &mdash; users see no API change.
 
 **Class declaration** &mdash; `src/cpu/x64/dynamic_quantize.hpp`:
 
@@ -586,7 +586,7 @@ Each gate has a concrete done-when criterion and the next gate cannot open until
 1. **Multi-output primitive ergonomics.** oneDNN primitives traditionally have one DST. Expressing scale and zero-point as `DNNL_ARG_DST_1` / `DST_2` works mechanically but is novel enough that the named aliases (`DNNL_ARG_DYNAMIC_SCALE`, `DNNL_ARG_DYNAMIC_ZERO_POINT`) are important for readability. Mitigation: documented prominently in the user-guide doc and the example.
 2. **Granularity expression via MD shape.** The granularity is implicit in `scale_md.dims`; reviewers may prefer an explicit enum (`per_tensor / per_row / ...`) on the op-desc. Option held open: an explicit `granularity_t` field can be added to the op-desc with an `auto` value that infers from MD, without breaking the proposed API. Decision deferred to first review.
 3. **Scale dtype `bf16`.** Ship `f32` scales in Phase 1 and add `bf16` in Phase 2. Risk: frameworks already producing `bf16` scales will need a dtype conversion for one release. Acceptable.
-4. **Compute-only via flag vs separate primitive.** The flag-vs-primitive choice is similar to the `embedding_lookup` algorithm choice in the `embedding_bag` companion RFC: both algorithms / modes share the same kernel structure, so a single primitive with a flag is cleaner than splitting.
+4. **Compute-only via flag vs separate primitive.** Compute-only and full-quantise share the same kernel structure (identical min/max scan and identical scale / zp computation; compute-only just skips the per-element write). A single primitive with a flag is cleaner than two separate primitive kinds whose impl lists, validation paths, and benchdnn drivers would all be near-duplicates.
 5. **Per-tensor parallelism.** Per-tensor mode has a single output; the kernel parallelises the min/max reduction internally. Risk: small inputs may not benefit from threading. Mitigation: the kernel falls back to a single-thread path under a size threshold (resolved at PD time, not in `execute()`).
 6. **Performance gate (CONTRIBUTING.md).** Every new primitive must show "material workload-level impact". Mitigation: ship benchdnn perf and vLLM W8A8 / W4A8 numbers with each production PR.
 
@@ -622,7 +622,12 @@ oneDNN's `attr.scales` / `attr.zero_points` could in principle carry a "compute-
 
 ### C. AVX-512 intrinsics vs Xbyak JIT port (intrinsics chosen)
 
-Same trade-off as the `embedding_bag` companion RFC. The kernel logic (min/max + scale/zp + saturating cast) is structurally simple, has no shape-dependent code-gen opportunity, and ZenDNN's existing intrinsic implementation is well-validated. Porting as intrinsics preserves that validation surface and lowers porting risk; a future Xbyak JIT impl can slot above the intrinsic one in the impl list if profiling ever justifies it &mdash; users see no API change.
+oneDNN's optimised x64 primitives are overwhelmingly Xbyak JIT-based (`jit_uni_softmax`, `jit_uni_reduction`, BRGEMM kernels, etc.). For dynamic quant we considered two paths:
+
+- **Intrinsic port (chosen).** The kernel logic (min/max + scale/zp + saturating cast) is structurally simple, has no shape-dependent code-gen opportunity that JIT would exploit, and is well-suited to plain AVX-512 intrinsics. The compiler emits the kernel at oneDNN build time; `primitive_t::init()` resolves a function pointer; `execute()` calls it directly. No JIT runtime, no per-PD compile cost, no Xbyak headers in `src/cpu/x64/dynamic_quantize.cpp`.
+- **Xbyak JIT rewrite (rejected).** Would add Xbyak emit infrastructure (executable mapping at primitive-creation time, per-instance JIT compile, label/operand bookkeeping) without any shape-specialisation win the intrinsic path doesn't already give us. Higher porting cost, larger review surface, no measurable performance benefit on this kernel shape.
+
+**Decision:** Port as intrinsics. The impl list keeps the door open for a future Xbyak JIT impl above the intrinsic one if benchmarking ever shows it would win on a meaningful set of shapes &mdash; that addition would be a separate, scope-limited contribution with no user-visible API change.
 
 ## 12. End-to-End Lifecycle
 
