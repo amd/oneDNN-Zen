@@ -40,7 +40,7 @@ The contribution must satisfy the three [Library Functionality Guidelines](../..
 
 | Criterion | How |
 |---|---|
-| **Performance** | The PoC already brings ZenDNN's AVX-512 / AOCL-DLP / FBGEMM dispatch under oneDNN's MatMul primitive. Performance is validated at model level via vLLM and benchdnn before each production PR. |
+| **Performance** | The PoC already brings ZenDNN's optimised dispatch under oneDNN's MatMul primitive. Performance is validated at model level via vLLM and benchdnn before each production PR. |
 | **Generality** | Works through oneDNN's standard primitive API. PyTorch, TensorFlow, ONNX Runtime, vLLM &mdash; every consumer that already calls oneDNN benefits with no integration work. |
 | **Complexity** | High-quality CPU MatMul / BMM / SDPA kernels are several engineer-years of work. Centralising them in oneDNN avoids each framework re-implementing them. |
 
@@ -55,11 +55,10 @@ The contribution must satisfy the three [Library Functionality Guidelines](../..
 ### Non-Goals
 - **GPU paths.** `zen64` is CPU-only.
 - **Replacing oneDNN's existing CPU kernels.** The `zen64` impl only *registers ahead* of the existing kernels in the impl list on AMD systems; it does not delete or modify any existing kernel.
-- **Exposing ZenDNN tuning knobs in the public API.** ZenDNN's `embag_kernel_t`, `eb_thread_algo_t`, `ZENDNNL_*` env vars stay internal to the `zen64` module and are not visible to oneDNN users.
 
 ## 3. ZenDNN Value Add (Background)
 
-**ZenDNN delivers the best CPU performance on AMD CPUs today** &mdash; it is AMD's purpose-built primitive library for Zen3 / Zen4 / Zen5 / Zen6 and ships in production through `zentorch`. The capabilities below are what differentiates ZenDNN's AMD-tuned path from a stock JIT-only impl on Zen-class CPUs.
+**ZenDNN gets its best CPU performance on AMD CPUs from AMD's AOCL-DLP library, which is optimised for Zen microarchitecture.** AOCL-DLP provides hand-tuned compute kernels (MatMul, conv, reduction) that exploit Zen-specific features (FMA throughput, cache hierarchy, AVX-512 BF16 / FP16 lanes) more effectively than a generic JIT path can. ZenDNN composes AOCL-DLP with its own dispatch, parallel-primitive, and low-overhead-API machinery to deliver production CPU performance on AMD CPUs (Zen3 / Zen4 / Zen5 / Zen6); it ships today through `zentorch`. The capabilities below are what differentiates ZenDNN's AMD-tuned path from a stock JIT-only impl on Zen-class CPUs.
 
 ### 3.1 Multi-backend Auto Tuner (TBP + Decision Tree)
 
@@ -80,28 +79,54 @@ Kernel-direct surface that minimises per-call book-keeping. Critical for small-s
 
 ### 3.4 Operator coverage today
 
-ZenDNN ships in production: MatMul (+ fused), BMM, GroupMatMul, SDPA, Reorder (Quant / Dequant / Dynamic Quant), Normalization, plus other key DL primitives. All are candidates for `zen64` registration over time.
+ZenDNN ships in production: MatMul (+ fused), BMM, GroupMatMul, SDPA, Reorder (Quant / Dequant / Dynamic Quant), Normalization. All are candidates for `zen64` registration over time.
 
 ## 4. Proposed Solution: `zen64` Module Design
 
 ### 4.1 Architecture overview
 
+`zen64` is a new, opt-in CPU sub-target inside oneDNN's existing `src/cpu/x64/` tree. The diagram below shows where it sits in the library hierarchy and how it relates to the (optional, externally linked) ZenDNN library:
+
 ```
-   x64 impl space:
-     BRGEMM · GEMM · jit_uni_* · ref · ...
-     ┌──────────────────────────────┐
-     │ zen64 (NEW, opt-in)          │
-     │   • registers in cpu_*_list  │
-     │   • PD::init() AMD vendor /  │
-     │     uArch / ISA / shape gate │
-     │   • execute() calls ZenDNN   │
-     └──────────┬───────────────────┘
-                │  (only when DNNL_ENABLE_ZENDNN=ON and runtime checks pass)
-                ▼
-          ZenDNN library
+   user code  (PyTorch · TensorFlow · ONNX Runtime · vLLM · llama.cpp · …)
+                                  │
+                                  ▼
+   ┌──────────────────────── oneDNN Library ───────────────────────────┐
+   │                                                                    │
+   │   Primitive APIs    dnnl::matmul · dnnl::reorder · dnnl::sdpa · …  │
+   │                                  │                                 │
+   │   Engines                CPU · GPU · XPU · Graph                   │
+   │                                  │                                 │
+   │   Architectures      x64 · aarch64 · riscv64 · ppc64 · s390x       │
+   │                                  │                                 │
+   │   x64 impl space     src/cpu/x64/                                  │
+   │                ┌──────────────────────────────────────────────┐    │
+   │                │  BRGEMM · GEMM · jit_uni_* · ref · …         │    │
+   │                │                                              │    │
+   │                │   ╔══════════════════════════════════════╗   │    │
+   │                │   ║   zen64    (NEW, opt-in)             ║   │    │
+   │                │   ║                                      ║   │    │
+   │                │   ║     build:    DNNL_ENABLE_ZENDNN=ON  ║   │    │
+   │                │   ║     runtime:  AMD vendor + uArch +   ║   │    │
+   │                │   ║                ISA checks pass       ║   │    │
+   │                │   ║                                      ║   │    │
+   │                │   ║   • registers ahead in cpu_*_list    ║   │    │
+   │                │   ║   • PD::init() validation gate       ║   │    │
+   │                │   ║   • execute() → ZenDNN               ║   │    │
+   │                │   ╚════════════════╤═════════════════════╝   │    │
+   │                └────────────────────┼────────────────────────┘    │
+   └─────────────────────────────────────┼──────────────────────────────┘
+                                         │  zendnnl::lowoha::*_direct(…)
+                                         ▼
+                            ┌──────────────────────────┐
+                            │      ZenDNN library      │
+                            │   (linked when build     │
+                            │    flag is ON; default   │
+                            │    OFF)                  │
+                            └──────────────────────────┘
 ```
 
-The new `src/cpu/x64/zen64/` directory is a regular `src/cpu/x64/` sub-tree, gated by `DNNL_ENABLE_ZENDNN=ON`. It contributes one impl class per primitive (e.g., `zen64::matmul_t`, `zen64::reorder_t`) registered in `src/cpu/<prim>/cpu_<prim>_list.cpp` ahead of the existing entries.
+The new `src/cpu/x64/zen64/` directory contributes one impl class per primitive (e.g. `zen64::matmul_t`, `zen64::reorder_t`) registered in `src/cpu/<prim>/cpu_<prim>_list.cpp` ahead of the existing entries. When the build flag is OFF (default), the entire `zen64` source set is excluded from compilation and `libdnnl.so` is byte-identical to today's oneDNN.
 
 ### 4.2 Build-time gating
 
@@ -187,8 +212,6 @@ Two strategies, evolving across PRs:
 
 - **Strategy A &mdash; ZenDNN-internal reorder + cache** *(PoC-current).* User calls `dnnl_matmul`; `zen64::matmul_t::execute()` hands the user-supplied weight to ZenDNN, which prepacks internally on first use and caches the prepacked tensor.
 - **Strategy B &mdash; oneDNN-side reorder ahead of time** *(in progress).* The PD requests a specific weight layout; user (or framework) issues a oneDNN reorder ahead of inference; `execute()` passes already-packed weights directly. More idiomatic and cache-friendly; needed for GroupGEMM / SDPA follow-ups.
-
-The first production PR ships Strategy A; Strategy B is the in-progress next step.
 
 ### 4.8 No public API changes
 
@@ -340,15 +363,7 @@ After the first PR lands, follow-ups (each its own PR with its own design note):
 - BMM, GroupGEMM (Grouped Memory Format), SDPA, Reorder (Quant / DeQuant).
 - ZenDNN LOWOHA integration in oneDNN's BRGEMM microkernel API.
 
-## 8. Risks
-
-1. **Acceptance of a vendor-specific backend.** oneDNN does not link any third-party CPU library at build time today. Need explicit maintainer alignment that `DNNL_ENABLE_ZENDNN=ON` is acceptable. Mitigation: default-OFF flag, no public API changes, full fallback semantics, no impact on Intel hosts.
-2. **ZenDNN ABI / version coupling.** A given oneDNN release built with the integration is pinned to a ZenDNN version range. Mitigation: keep the adapter surface narrow (one `lowoha::*_direct` call per primitive); pin a known-good ZenDNN commit in oneDNN's CMake.
-3. **Reorder strategy choice.** Strategy A (PoC-current) is opaque to oneDNN's primitive cache; Strategy B is more idiomatic but more PD plumbing. The first PR ships both: A as default, B available for ahead-of-time prepack.
-4. **Maintenance burden.** Mitigation: the AMD ZenDNN team owns `zen64`; oneDNN maintainers review the integration plumbing (impl-list registration, build option, fallback semantics) but not the kernels.
-5. **Performance gate.** Per `CONTRIBUTING.md`, every change must show "material workload-level impact." Mitigation: benchdnn perf + vLLM model-level numbers shipped with the production PR.
-
-## 9. Alternatives Considered
+## 8. Alternatives Considered
 
 ### A. Native upstream of every ZenDNN kernel (rejected)
 
