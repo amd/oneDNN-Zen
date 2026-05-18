@@ -413,10 +413,6 @@ For workloads where activation shape varies across calls (e.g. variable-length L
 
 With the library-side cache, the second option becomes the default behaviour without framework code &mdash; if two PDs (one per shape bucket) want different layouts, the cache holds two entries keyed on the PD hash and the same data pointer; both prepacks reuse the same source data and the cache enforces capacity globally.
 
-### 7.4 Group MatMul and other multi-weight workloads
-
-When a workload uses many weight tensors (e.g. MoE inference with many experts, transformer-block stacks where each layer has its own weights), the cache concentrates the per-tensor reorder cost into the first call and reuses across all subsequent calls. The MB-bound capacity gives the framework a single global knob to limit oneDNN's working-set growth.
-
 ## 8. End-to-End Lifecycle
 
 ### 8.1 First `execute()` (cache miss)
@@ -501,18 +497,7 @@ prim.execute(stream, { ..., {DNNL_ARG_WEIGHTS, new_wei}, ... });
 
 This matches Graph-API behaviour and keeps the user contract simple: pointer equality is the cache key.
 
-## 9. Risks and Open Questions
-
-1. **Adding a property to an opaque public type.** `dnnl_memory_desc_t` is documented as opaque; the property must be stored in the existing `extra` field to keep the public handle stable. The setter / getter functions are the user-facing surface. No ABI break.
-2. **Cache key choice (data pointer vs content hash).** Pointer-equality matches Graph API and is cheap; content-hash is safer (catches the case where the user mutates the buffer in place despite the contract) but costs a hash on every execute. The proposal uses pointer-equality (matches Graph). Consideration: add a debug-build assertion that hashes the first/last cache lines and compares on cache hit, to surface contract violations early without paying the hash on release builds. Decision deferred to first review.
-3. **Lifetime / dangling pointers.** If the user frees the underlying buffer while a cache entry still references it, the cache holds a dangling reference. Mitigation: the user-contract documentation makes this an explicit responsibility (same as Graph API); a follow-up RFC could propose an explicit weak-ref / invalidation API if real workloads ask for it.
-4. **Multi-thread cache coherency.** A common pattern is multiple inference threads sharing the same model. The cache uses a `shared_mutex` for read-mostly access; the per-key fine-grained lock prevents two threads from running the reorder concurrently on a cold key.
-5. **Memory accounting opacity.** The user sees only the cache capacity; they cannot easily tell how much of it is in use. A diagnostic API (`dnnl_get_const_weight_cache_usage()`) is a candidate follow-up. Phase 1 keeps the API minimal.
-6. **Interaction with `attr.scratchpad_mode = user`.** The cache buffers are owned by the library, not by user-supplied scratchpad. The two coexist cleanly because they serve different purposes (transient vs persistent). Document this in the user-guide doc.
-7. **Cache scope across engines.** The cache is per-engine to mirror Graph API. If a user constructs multiple CPU engines (rare but legal), each engine has its own cache. This is consistent with Graph API and keeps the lifetime story simple.
-8. **Performance gate (CONTRIBUTING.md).** Every new mechanism must show "material workload-level impact." Mitigation: ship benchdnn perf evidence (warm-cache vs cold-cache for representative LLM and recommendation MatMul shapes) and model-level numbers (vLLM warm-up vs steady-state inference latency) with the production PR.
-
-## 10. Alternatives Considered
+## 9. Alternatives Considered
 
 ### A. Use a `primitive_attr` flag instead of a memory-desc property (rejected)
 
