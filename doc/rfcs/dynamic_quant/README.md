@@ -18,6 +18,11 @@ A standalone primitive is the right shape for this operation in oneDNN because i
 
 ---
 
+> :grey_question: **FAQ — "Why a new primitive instead of extending `reorder`?"**
+> Short answer: dynamic quant inverts the role of scales / zps (caller-input &rarr; library-output), has multiple outputs, and a compute-only mode that produces no dst &mdash; none of which fit `reorder`'s 1-in / 1-out abstraction. Same shape as `batch_normalization`'s dual-mode `mean` / `variance` &mdash; oneDNN already handles this pattern by giving the operation its own primitive, not by extending another. Full argument in [§1.4](#14-why-a-new-primitive-and-not-an-extension-of-reorder) and [§11.A](#a-extend-reorder-instead-of-adding-a-new-primitive-rejected).
+
+---
+
 ## 1. Background and Motivation
 
 ### 1.1 What dynamic quantisation is, and why it matters
@@ -46,7 +51,15 @@ Upstream that capability into oneDNN as a first-class primitive `dynamic_quantiz
 
 All in one pass over the source data, with cache-resident intermediates and per-CCD-aware threading.
 
-### 1.4 Library functionality criteria (CONTRIBUTING.md)
+### 1.4 Why a new primitive (and not an extension of `reorder`)
+
+The most natural-looking alternative is to extend the existing `reorder` primitive, since `reorder` already handles dtype conversion and applies caller-supplied `attr.scales` / `attr.zero_points` for static quantisation. We considered that and rejected it; the full argument lives in §11.A.
+
+The short version: dynamic quant **inverts the role** of scales and zero-points (caller-supplied input &rarr; library-computed output), it has **multiple outputs** (dst + scale + optional zp), and it has a **compute-only mode** that produces no dst at all &mdash; none of which fit `reorder`'s 1-in / 1-out abstraction or its existing attribute contract. Bolting all three onto `reorder` would mean the same field (`attr.scales`) carries opposite meanings under a flag, the impl list mixes layout-converter kernels with reduction-then-cast kernels, and a primitive whose name promises a dst sometimes produces no dst.
+
+oneDNN already has the right precedent for this exact shape of operation: **`batch_normalization`**. BN's `mean` and `variance` flip between **inputs** (`use_global_stats`, inference) and **outputs** (computed from the batch, training) under a flag, and BN supports a similar dual-mode contract for those tensors &mdash; but it does so as **its own primitive**, not by extending another. We follow the same pattern: dynamic quant gets its own primitive (`dynamic_quantize`), with `scale` / `zero_point` modelled as first-class output MDs and `compute_only` as a first-class flag, leaving `reorder`'s contract entirely untouched.
+
+### 1.5 Library functionality criteria (CONTRIBUTING.md)
 
 | Criterion | How |
 |---|---|
@@ -581,12 +594,22 @@ Each gate has a concrete done-when criterion and the next gate cannot open until
 
 ### A. Extend `reorder` instead of adding a new primitive (rejected)
 
-ZenDNN's reference implementation lives inside its reorder API (`reorder_params_t::dynamic_quant = true`). One option is to mirror that and extend oneDNN's `reorder` primitive with a `dynamic_quant` mode.
+oneDNN's existing `reorder` primitive already covers static quantisation: it accepts `attr.scales` and `attr.zero_points` from the caller and applies them while doing dtype / layout conversion. A natural-looking option is to mirror ZenDNN's reference implementation (`reorder_params_t::dynamic_quant = true`) and extend `reorder` with a `dynamic_quant` mode that flips `attr.scales` from input to output and adds a `compute_only` flag.
 
-- **Pros:** No new primitive; smaller API surface.
-- **Cons:** `reorder` has one DST; dynamic quant has up to three (DST + scale + zp). Bolting auxiliary outputs onto a single-output primitive breaks the abstraction. `reorder`'s scales / zps are *parametric inputs* today; flipping the same fields to be *outputs* in a special mode is confusing. Compute-only mode (no DST) is even harder to express on top of reorder.
+This is the question every reviewer will ask first. We considered it and rejected it for three concrete reasons.
 
-**Decision:** Reject. Add a dedicated `dynamic_quantize` primitive with multiple DST args and an explicit `compute_only` flag.
+**1. Inverted semantics on the same field is the worst kind of API smell.**
+In every existing use of `reorder`, `attr.scales` and `attr.zero_points` are **caller-supplied parameters** &mdash; the caller computes them via a calibration pass or static configuration and passes them in. Flipping the meaning of the same fields to **library-computed outputs** under a flag means every code-reading and code-reviewing path in `reorder` has to keep two opposite contracts in mind. Whether `attr.scales` is "what to apply" or "where to write the result" depends on a flag set elsewhere in the descriptor. That is a future-bug factory. The proposed `dynamic_quantize` primitive sidesteps it entirely: `scale` and `zero_point` live in dedicated MD slots that are unambiguously outputs, and `attr.scales` retains its single, consistent meaning everywhere in oneDNN.
+
+**2. `reorder`'s 1-in / 1-out abstraction is what makes its impl list manageable.**
+`reorder` has many specialised implementations (jit-uni, format-specific paths, AMX paths, etc.) all sharing the same shape: pull from one src, push to one dst. Dynamic-quant kernels do not share that shape &mdash; they are reduction-then-cast over groups, with completely different optimisation targets (min/max-bandwidth-bound, not format-conversion-bound) and a fundamentally different inner loop. Putting them inside `cpu_reorder_list.cpp` would force every reorder reviewer to keep dynamic-quant kernel logic in their head, and force the dispatcher to branch on a flag at impl-selection time across an already large list. Splitting the operation into its own primitive keeps each review surface scoped to one concern.
+
+**3. The `compute_only` mode is a contradiction inside `reorder`.**
+The whole point of `reorder` is to write a destination tensor &mdash; that is its name and its abstraction. A reorder primitive with `compute_only = true` (no `dst`) is a primitive in name only; it does the *opposite* of what its name suggests. Inside `dynamic_quantize`, on the other hand, `compute_only` is one of two equally valid execution modes the primitive is **designed for** (the framework computes scales / zps for reuse across multiple downstream consumers, or for pipeline staging). The mode reads as natural in the primitive that owns it and as a contradiction in the primitive that does not.
+
+**Precedent.** This is the same shape `batch_normalization` follows: BN's `mean` / `variance` flip between **inputs** (when `use_global_stats` is set, e.g. inference) and **outputs** (when computed from the batch, e.g. training) under a flag. oneDNN handled that dual-mode multi-output operation by giving it its **own** primitive, **not** by extending another existing primitive. The dynamic-quant case is a direct analogue: scales / zps that flip between caller-supplied inputs (today's static-quant `reorder`) and library-computed outputs (the new dynamic case), with a compute-only mode that mirrors BN's stats-only path.
+
+**Decision:** Reject. Add a dedicated `dynamic_quantize` primitive with explicit `scale` / `zero_point` output MDs and an explicit `compute_only` flag. `reorder`'s contract stays unchanged and its impl list stays scoped to layout / dtype conversion.
 
 ### B. Express dynamic quantisation as an attribute on consumer primitives (rejected for now)
 
