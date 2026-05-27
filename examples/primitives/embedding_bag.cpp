@@ -135,7 +135,7 @@ void embedding_bag_example(dnnl::engine::kind engine_kind) {
     read_from_dnnl_memory(dst_data.data(), dst_mem);
 
     // Check correctness
-    for (int i = 0; i < dst_data.size(); ++i)
+    for (uint64_t i = 0; i < dst_data.size(); ++i)
       std::cout << "i:" << i << ":" << dst_data[i] << std::endl;
 }
 

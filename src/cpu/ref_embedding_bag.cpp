@@ -167,7 +167,7 @@ void embag_ref_kernel(
                   float in_f32 = static_cast<float>(f16_row[j]);
                   float wt_f32_cast = static_cast<float>(wt);
                   float acc_f32 = static_cast<float>(f16_accum_row[j]);
-                  //f16_accum_row[j] = float16_t(std::fmaf(in_f32, wt_f32_cast, acc_f32));
+                  f16_accum_row[j] = float16_t(std::fmaf(in_f32, wt_f32_cast, acc_f32));
                 }
               }
               first_valid_index = false;
@@ -180,7 +180,7 @@ void embag_ref_kernel(
           for (auto j = 0; j < width; ++j) {
             float a = static_cast<float>(f16_accum_row[j]);
             float d = static_cast<float>(div);
-            //f16_accum_row[j] = float16_t(a / d);
+            f16_accum_row[j] = float16_t(a / d);
           }
         }
 
@@ -218,14 +218,14 @@ void embag_ref_kernel(
           // Get input row pointer (convert from BF16/F16 if needed)
           const float *input_row;
           if (input_is_f16) {
-            const uint16_t *f16_row = reinterpret_cast<const uint16_t *>
-                                      (&input[input_offset]);
+            // const uint16_t *f16_row = reinterpret_cast<const uint16_t *>
+            //                           (&input[input_offset]);
             //float16_t::f16_to_f32_buf(f16_row, temp_input_row.data(), width);
             input_row = temp_input_row.data();
           }
           else if (input_is_bf16) {
-            const uint16_t *bf16_row = reinterpret_cast<const uint16_t *>
-                                       (&input[input_offset]);
+            // const uint16_t *bf16_row = reinterpret_cast<const uint16_t *>
+            //                            (&input[input_offset]);
             //bfloat16_t::bf16_to_f32_buf(bf16_row, temp_input_row.data(), width);
             input_row = temp_input_row.data();
           }
@@ -282,14 +282,14 @@ void embag_ref_kernel(
       }
 
       // Convert output back to BF16/F16 if needed
-      if (output_is_f16) {
-        uint16_t *f16_dst = reinterpret_cast<uint16_t *>(&dst[dst_offset]);
-        //float16_t::f32_to_f16(temp_output_row.data(), f16_dst, width);
-      }
-      else if (output_is_bf16) {
-        int16_t *bf16_dst = reinterpret_cast<int16_t *>(&dst[dst_offset]);
-        //bfloat16_t::f32_to_bf16(temp_output_row.data(), bf16_dst, width);
-      }
+      // if (output_is_f16) {
+      //   //uint16_t *f16_dst = reinterpret_cast<uint16_t *>(&dst[dst_offset]);
+      //   //float16_t::f32_to_f16(temp_output_row.data(), f16_dst, width);
+      // }
+      // else if (output_is_bf16) {
+      //   //int16_t *bf16_dst = reinterpret_cast<int16_t *>(&dst[dst_offset]);
+      //   //bfloat16_t::f32_to_bf16(temp_output_row.data(), bf16_dst, width);
+      // }
     }
   }
 
