@@ -72,6 +72,11 @@ const std::map<data_kind_t, data_kind_entry_t> &data_kind_table() {
             {DROPOUT_MASK, {{DNNL_ARG_ATTR_DROPOUT_MASK}, "DROPOUT_MASK"}},
             {DST_SCALES, {{DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST}, "DST_SCALES"}},
             {SDPA_STATS, {{DNNL_ARG_DST_1}, "SDPA_STATS"}},
+            {EMBAG_TABLE, {{DNNL_ARG_EMBEDDING_BAG_TABLE}, "EMBAG_TABLE"}},
+            {EMBAG_DST, {{DNNL_ARG_EMBEDDING_BAG_DST}, "EMBAG_DST"}},
+            {EMBAG_INDICES, {{DNNL_ARG_EMBEDDING_BAG_INDICES}, "EMBAG_INDICES"}},
+            {EMBAG_OFFSETS, {{DNNL_ARG_EMBEDDING_BAG_OFFSETS}, "EMBAG_OFFSETS"}},
+            {EMBAG_WT, {{DNNL_ARG_EMBEDDING_BAG_WEIGHTS}, "EMBAG_WT"}},
             {DAT_TOTAL, {{DNNL_ARG_UNDEF}, "incorrect data kind"}},
     };
     return data_kind_table_;
