@@ -214,6 +214,7 @@
 #cmakedefine01 BUILD_SDPA
 #cmakedefine01 BUILD_SHUFFLE
 #cmakedefine01 BUILD_SOFTMAX
+#cmakedefine01 BUILD_EMBEDDING_BAG
 #cmakedefine01 BUILD_SUM
 // Primitives CPU ISA controls
 #cmakedefine01 BUILD_PRIMITIVE_CPU_ISA_ALL

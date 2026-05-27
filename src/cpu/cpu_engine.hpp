@@ -79,6 +79,7 @@ DECLARE_IMPL_LIST(resampling);
 DECLARE_IMPL_LIST(rnn);
 DECLARE_IMPL_LIST(shuffle);
 DECLARE_IMPL_LIST(softmax);
+DECLARE_IMPL_LIST(embedding_bag);
 
 #undef DECLARE_IMPL_LIST
 
@@ -115,6 +116,7 @@ public:
             CASE(rnn);
             CASE(shuffle);
             CASE(softmax);
+            CASE(embedding_bag);
             case primitive_kind::sdpa: return empty_list;
             case primitive_kind::gated_mlp: return empty_list;
             default: assert(!"unknown primitive kind"); return empty_list;

@@ -50,6 +50,7 @@
 #include "softmax/softmax.hpp"
 #include "sum/sum.hpp"
 #include "zeropad/zeropad.hpp"
+#include "embedding_bag/embedding_bag.hpp"
 
 #ifdef BUILD_GRAPH
 #include "graph/graph.hpp"
@@ -120,6 +121,8 @@ int main(int argc, char **argv) {
         rnn::bench(--argc, ++argv);
     } else if (!strcmp("--softmax", argv[0])) {
         softmax::bench(--argc, ++argv);
+    } else if (!strcmp("--embeddingbag", argv[0])) {
+        embedding_bag::bench(--argc, ++argv);
     } else if (!strcmp("--pool", argv[0])) {
         pool::bench(--argc, ++argv);
     } else if (!strcmp("--prelu", argv[0])) {

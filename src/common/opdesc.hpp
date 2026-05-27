@@ -23,6 +23,7 @@
 
 #include <vector>
 #include <type_traits>
+#include <cstdint>
 
 namespace dnnl {
 namespace impl {
@@ -543,6 +544,36 @@ struct softmax_desc_t : public op_desc_t {
     memory_desc_t dst_desc;
     // Destination gradient memory descriptor.
     memory_desc_t diff_dst_desc;
+};
+
+/// A descriptor of an embedding bag.
+struct embedding_bag_desc_t : public op_desc_t {
+    embedding_bag_desc_t() : op_desc_t(primitive_kind::embedding_bag) {}
+
+    DECLARE_COMMON_OP_DESC_CLONE(embedding_bag_desc_t);
+
+    // The kind of propagation. Possible values: #dnnl_forward_training,
+    // #dnnl_forward_inference, and #dnnl_backward_data.
+    prop_kind_t prop_kind {};
+    // sum, mean, max, lookup
+    alg_kind_t alg_kind {};
+    // Table memory descriptor.
+    memory_desc_t table_desc;
+    // Table memory descriptor.
+    memory_desc_t indices_desc;
+    // Table memory descriptor.
+    memory_desc_t offsets_desc;
+    // Table memory descriptor.
+    memory_desc_t weights_desc;
+    // Destination memory descriptor.
+    memory_desc_t dst_desc;
+
+    // padding index
+    int64_t padding_idx;
+    // is weight vector present
+    bool is_weight;
+    // include last offset
+    bool include_last_offset;
 };
 
 // A descriptor of a binary operation.

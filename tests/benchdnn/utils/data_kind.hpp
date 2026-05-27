@@ -45,6 +45,13 @@ enum data_kind_t {
     // SDPA softmax stats
     SDPA_STATS,
 
+    // embeddding bag types
+    EMBAG_TABLE,
+    EMBAG_DST,
+    EMBAG_INDICES,
+    EMBAG_OFFSETS,
+    EMBAG_WT,
+
     DAT_TOTAL,
 };
 
