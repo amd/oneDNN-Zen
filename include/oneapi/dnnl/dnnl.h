@@ -2272,6 +2272,60 @@ dnnl_status_t DNNL_API dnnl_softmax_backward_primitive_desc_create(
 
 /// @} dnnl_api_softmax
 
+/// @addtogroup dnnl_api_embedding_bag
+/// @{
+
+/// Creates a primitive descriptor for a embedding bag forward propagation
+/// primitive.
+///
+/// @param primitive_desc Output primitive descriptor.
+/// @param engine Engine to use.
+/// @param prop_kind Propagation kind. Possible values are
+///     #dnnl_forward_training and #dnnl_forward_inference.
+/// @param alg_kind sum, mean, max and lookup
+/// @param src_desc Source memory descriptor.
+/// @param dst_desc Destination memory descriptor.
+/// @param attr Primitive attributes (can be NULL).
+/// @returns #dnnl_success on success and a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_embedding_bag_forward_primitive_desc_create(
+        dnnl_primitive_desc_t *primitive_desc, dnnl_engine_t engine,
+        dnnl_prop_kind_t prop_kind, dnnl_alg_kind_t alg_kind,
+        const_dnnl_memory_desc_t table_desc,
+        const_dnnl_memory_desc_t indices_desc,
+        const_dnnl_memory_desc_t offsets_desc,
+        const_dnnl_memory_desc_t weights_desc,
+        const_dnnl_memory_desc_t dst_desc,
+        int64_t                  padding_idx,
+        int                      is_weight,
+        int                      include_last_offset,
+        const_dnnl_primitive_attr_t attr);
+
+/// Creates a primitive descriptor for a embedding bag backward propagation
+///primitive.
+///
+/// @param primitive_desc Output primitive descriptor.
+/// @param engine Engine to use.
+/// @param alg_kind Softmax algorithm kind: either #dnnl_softmax_accurate, or
+///     #dnnl_softmax_log.
+/// @param diff_src_desc Diff source memory descriptor.
+/// @param diff_dst_desc Diff destination memory descriptor.
+/// @param dst_desc Destination memory descriptor.
+/// @param softmax_axis Axis over which softmax is computed.
+/// @param hint_fwd_pd Primitive descriptor for a respective forward propagation
+///     primitive.
+/// @param attr Primitive attributes (can be NULL).
+/// @returns #dnnl_success on success and a status describing the error
+///     otherwise.
+/* dnnl_status_t DNNL_API dnnl_embedding_bag_backward_primitive_desc_create( */
+/*         dnnl_primitive_desc_t *primitive_desc, dnnl_engine_t engine, */
+/*         dnnl_alg_kind_t alg_kind, const_dnnl_memory_desc_t diff_src_desc, */
+/*         const_dnnl_memory_desc_t diff_dst_desc, */
+/*         const_dnnl_primitive_desc_t hint_fwd_pd, */
+/*         const_dnnl_primitive_attr_t attr); */
+
+/// @} dnnl_api_softmax
+
 /// @addtogroup dnnl_api_pooling
 /// @{
 

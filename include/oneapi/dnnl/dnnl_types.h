@@ -2095,6 +2095,8 @@ typedef enum {
     dnnl_layer_normalization,
     /// A group normalization primitive.
     dnnl_group_normalization,
+    /// An embedding bag primitive.
+    dnnl_embedding_bag,
 
     // Max value to prevent UB for internal-use-only values.
     dnnl_primitive_kind_max = 0x7fff,
@@ -2252,6 +2254,14 @@ typedef enum {
     dnnl_softmax_accurate = 0x30000,
     /// Logsoftmax
     dnnl_softmax_log,
+    /// Embedding bag sum
+    dnnl_embedding_bag_sum = 0x31000,
+    /// Embedding bag mean
+    dnnl_embedding_bag_mean = 0x31001,
+    /// Embedding bag max
+    dnnl_embedding_bag_max = 0x31002,
+    /// Embedding bag lookup
+    dnnl_embedding_bag_lookup = 0x31003,
 } dnnl_alg_kind_t;
 
 /// Flags for normalization primitives.
@@ -2551,24 +2561,36 @@ typedef const struct dnnl_primitive *const_dnnl_primitive_t;
 /// A special mnemonic for reorder source argument. An alias for
 /// #DNNL_ARG_SRC_0.
 #define DNNL_ARG_FROM DNNL_ARG_SRC_0
+/// A special mnemonic for embedding bag table argument. An alias for
+/// #DNNL_ARG_SRC_0.
+#define DNNL_ARG_EMBEDDING_BAG_TABLE DNNL_ARG_SRC_0
 
 /// Source argument #1.
 #define DNNL_ARG_SRC_1 2
 /// A special mnemonic for RNN input recurrent hidden state vector. An alias
 /// for #DNNL_ARG_SRC_1.
 #define DNNL_ARG_SRC_ITER DNNL_ARG_SRC_1
+/// A special mnemonic for embedding bag indices argument. An alias for
+/// #DNNL_ARG_SRC_1.
+#define DNNL_ARG_EMBEDDING_BAG_INDICES DNNL_ARG_SRC_1
 
 /// Source argument #2.
 #define DNNL_ARG_SRC_2 3
 /// A special mnemonic for RNN input recurrent cell state vector. An alias for
 /// #DNNL_ARG_SRC_2.
 #define DNNL_ARG_SRC_ITER_C DNNL_ARG_SRC_2
+/// A special mnemonic for embedding bag offsets argument. An alias for
+/// #DNNL_ARG_SRC_2.
+#define DNNL_ARG_EMBEDDING_BAG_OFFSETS DNNL_ARG_SRC_2
 
 /// Source argument #3.
 #define DNNL_ARG_SRC_3 4
 /// A special mnemonic for RNN input recurrent cell attention vector. An alias for
 /// #DNNL_ARG_SRC_3.
 #define DNNL_ARG_AUGRU_ATTENTION DNNL_ARG_SRC_3
+/// A special mnemonic for embedding bag weights argument. An alias for
+/// #DNNL_ARG_SRC_3.
+#define DNNL_ARG_EMBEDDING_BAG_WEIGHTS DNNL_ARG_SRC_3
 
 /// Destination argument #0.
 #define DNNL_ARG_DST_0 17
@@ -2580,6 +2602,8 @@ typedef const struct dnnl_primitive *const_dnnl_primitive_t;
 #define DNNL_ARG_TO DNNL_ARG_DST_0
 /// A special mnemonic for RNN output vector. An alias for #DNNL_ARG_DST_0.
 #define DNNL_ARG_DST_LAYER DNNL_ARG_DST_0
+/// A special mnemonic for embedding bag output. An alias for #DNNL_ARG_DST_0.
+#define DNNL_ARG_EMBEDDING_BAG_DST DNNL_ARG_DST_0
 
 /// Destination argument #1.
 #define DNNL_ARG_DST_1 18

@@ -90,6 +90,7 @@ file(GLOB PRIM_TEST_CASES_SRC
                               test_resampling.cpp
                               test_reduction.cpp
                               test_softmax.cpp
+                              test_embedding_bag.cpp
                               test_concurrency.cpp
                               test_layer_normalization.cpp
                               test_lrn.cpp

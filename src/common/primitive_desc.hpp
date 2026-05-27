@@ -355,6 +355,7 @@ struct primitive_desc_t {
     virtual status_t query(query_t what, int idx, void *result) const {
         auto safe_ret_md = [&](const memory_desc_t *_) {
             if (_ == nullptr) return status::not_required;
+
             *(const memory_desc_t **)result = _;
             return status::success;
         };
@@ -368,7 +369,7 @@ struct primitive_desc_t {
                 *(dim_t *)result = scratchpad_size(scratchpad_mode::library);
                 break;
 
-            case query::exec_arg_md: return safe_ret_md(arg_md(idx));
+            case query::exec_arg_md: safe_ret_md(arg_md(idx));
             case query::src_md: return safe_ret_md(src_md(idx));
             case query::diff_src_md: return safe_ret_md(diff_src_md(idx));
             case query::dst_md: return safe_ret_md(dst_md(idx));

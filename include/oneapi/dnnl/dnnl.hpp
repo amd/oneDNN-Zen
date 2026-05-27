@@ -151,6 +151,8 @@ struct primitive : public handle<dnnl_primitive_t> {
         layer_normalization = dnnl_layer_normalization,
         /// A group normalization primitive
         group_normalization = dnnl_group_normalization,
+        /// A group normalization primitive
+        embedding_bag = dnnl_embedding_bag,
     };
 
     using handle::handle;
@@ -526,6 +528,14 @@ enum class algorithm {
     softmax_accurate = dnnl_softmax_accurate,
     /// LogSoftmax, numerically stable
     softmax_log = dnnl_softmax_log,
+    /// Embedding bag sum
+    embedding_bag_sum = dnnl_embedding_bag_sum,
+    /// Embedding bag mean
+    embedding_bag_mean = dnnl_embedding_bag_mean,
+    /// Embedding bag max
+    embedding_bag_max = dnnl_embedding_bag_max,
+    /// Embedding bag lookup
+    embedding_bag_lookup = dnnl_embedding_bag_lookup,
 };
 
 /// Converts algorithm kind enum value from C++ API to C API type.
@@ -8119,6 +8129,212 @@ struct softmax_backward : public primitive {
 };
 
 /// @} dnnl_api_softmax
+
+/// @addtogroup dnnl_api_embedding_bag Embedding Bag
+///
+/// A primitive to perform embedding bag.
+///
+/// @sa @ref dev_guide_embedding_bag in developer guide
+///
+/// @{
+
+/// Embedding Bag forward propagation primitive.
+struct embedding_bag_forward : public primitive {
+    /// Primitive descriptor for a softmax forward propagation primitive.
+    struct primitive_desc : public dnnl::primitive_desc {
+        /// Default constructor. Produces an empty object.
+        primitive_desc() = default;
+
+        /// Constructs a primitive descriptor for a embedding bag forward
+        /// propagation primitive.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::forward_training, and
+        ///     #dnnl::prop_kind::forward_inference.
+        /// @param aalgorithm Embeding bag algorithm kind: either
+        ///     #dnnl::algorithm::embedding_bag_sum,
+        ///     or #dnnl::algorithm::embedding_bag_mean,
+        ///     or #dnnl::algorithm::embedding_bag_max,
+        ///     or #dnnl::algorithm::embedding_bag_lookup,
+        /// @param src_desc Source memory descriptor.
+        /// @param dst_desc Destination memory descriptor.
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                algorithm aalgorithm, const memory::desc &table_desc,
+                const memory::desc &indices_desc,
+                const memory::desc &offsets_desc,
+                const memory::desc &weights_desc,
+                const memory::desc &dst_desc,
+                int64_t            padding_idx,
+                bool               include_last_offset,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false) {
+
+            bool is_weight  = true;
+            dnnl_primitive_desc_t pd = nullptr;
+
+            dnnl_status_t status = dnnl_embedding_bag_forward_primitive_desc_create(
+                    &pd, aengine.get(), dnnl::convert_to_c(aprop_kind),
+                    dnnl::convert_to_c(aalgorithm), table_desc.get(),
+                    indices_desc.get(),offsets_desc.get(),
+                    weights_desc.get(),
+                    dst_desc.get(),
+                    padding_idx, is_weight, include_last_offset,
+                    attr.get());
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a primitive descriptor for "
+                        "the embedding bag forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
+            reset(pd);
+        }
+
+        /// Constructs a primitive descriptor for a embedding bag forward
+        /// propagation primitive.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::forward_training, and
+        ///     #dnnl::prop_kind::forward_inference.
+        /// @param aalgorithm Embeding bag algorithm kind: either
+        ///     #dnnl::algorithm::embedding_bag_sum,
+        ///     or #dnnl::algorithm::embedding_bag_mean,
+        ///     or #dnnl::algorithm::embedding_bag_max,
+        ///     or #dnnl::algorithm::embedding_bag_lookup,
+        /// @param src_desc Source memory descriptor.
+        /// @param dst_desc Destination memory descriptor.
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                algorithm aalgorithm, const memory::desc &table_desc,
+                const memory::desc &indices_desc,
+                const memory::desc &offsets_desc,
+                const memory::desc &dst_desc,
+                int64_t            padding_idx,
+                bool               include_last_offset,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false) {
+
+            dnnl_primitive_desc_t pd = nullptr;
+            dnnl_status_t status = dnnl_embedding_bag_forward_primitive_desc_create(
+                    &pd, aengine.get(), dnnl::convert_to_c(aprop_kind),
+                    dnnl::convert_to_c(aalgorithm), table_desc.get(),
+                    indices_desc.get(),offsets_desc.get(),
+                    nullptr,
+                    dst_desc.get(),
+                    padding_idx, false, include_last_offset,
+                    attr.get());
+
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a primitive descriptor for "
+                        "the embedding bag forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
+            reset(pd);
+        }
+
+        /// Constructs a primitive descriptor for a embedding bag forward
+        /// propagation primitive.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::forward_training, and
+        ///     #dnnl::prop_kind::forward_inference.
+        /// @param aalgorithm Embeding bag algorithm kind: either
+        ///     #dnnl::algorithm::embedding_bag_sum,
+        ///     or #dnnl::algorithm::embedding_bag_mean,
+        ///     or #dnnl::algorithm::embedding_bag_max,
+        ///     or #dnnl::algorithm::embedding_bag_lookup,
+        /// @param src_desc Source memory descriptor.
+        /// @param dst_desc Destination memory descriptor.
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                algorithm aalgorithm, const memory::desc &table_desc,
+                const memory::desc &indices_desc,
+                const memory::desc &dst_desc,
+                int64_t            padding_idx = -1,
+                bool               include_last_offset = false,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false) {
+
+            dnnl_primitive_desc_t pd = nullptr;
+            dnnl_status_t status = dnnl_embedding_bag_forward_primitive_desc_create(
+                    &pd, aengine.get(), dnnl::convert_to_c(aprop_kind),
+                    dnnl::convert_to_c(aalgorithm), table_desc.get(),
+                    indices_desc.get(), nullptr,
+                    nullptr,
+                    dst_desc.get(),
+                    padding_idx, false, include_last_offset,
+                    attr.get());
+
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a primitive descriptor for "
+                        "the embedding bag forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
+            reset(pd);
+        }
+
+        /// Constructs a primitive descriptor for a embedding bag forward
+        /// propagation primitive from a C API primitive descriptor that must
+        /// have a matching kind.
+        ///
+        /// @param pd C API primitive descriptor for a softmax forward
+        ///     propagation primitive.
+        primitive_desc(dnnl_primitive_desc_t pd)
+            : dnnl::primitive_desc(pd, dnnl::primitive::kind::embedding_bag,
+              dnnl::prop_kind::forward_training,
+              dnnl::prop_kind::forward_inference) {}
+
+        /// @copydoc dnnl::primitive_desc_base::src_desc()const
+        memory::desc src_desc() const { return base::src_desc(0); }
+
+        /// @copydoc dnnl::primitive_desc_base::dst_desc()const
+        memory::desc dst_desc() const { return base::dst_desc(0); }
+
+        /// @copydoc dnnl::primitive_desc_base::get_algorithm()const
+        dnnl::algorithm get_algorithm() const { return base::get_algorithm(); }
+
+        /// @copydoc dnnl::primitive_desc_base::get_prop_kind()const
+        dnnl::prop_kind get_prop_kind() const { return base::get_prop_kind(); }
+    };
+
+    /// Default constructor. Produces an empty object.
+    embedding_bag_forward() = default;
+
+    /// Constructs a embedding bag forward propagation primitive.
+    /// @param pd Primitive descriptor for a embedding bag forward propagation
+    ///     primitive.
+    embedding_bag_forward(const primitive_desc &pd) : primitive(pd) {}
+
+    /// Constructs a embedding bag forward propagation primitive from a cache blob.
+    /// @param pd Primitive descriptor for a softmax forward propagation
+    ///     primitive.
+    /// @param cache_blob Cache blob.
+    embedding_bag_forward(
+            const primitive_desc &pd, const std::vector<uint8_t> &cache_blob)
+        : primitive(pd, cache_blob) {}
+};
+
+/// @} dnnl_api_embedding_bag
 
 /// @addtogroup dnnl_api_batch_normalization Batch Normalization
 ///

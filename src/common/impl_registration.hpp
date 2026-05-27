@@ -201,6 +201,13 @@
     {}
 #endif
 
+#if BUILD_PRIMITIVE_ALL || BUILD_EMBEDDING_BAG
+#define REG_EMBEDDING_BAG_P(...) __VA_ARGS__
+#else
+#define REG_EMBEDDING_BAG_P(...) \
+    {}
+#endif
+
 #if BUILD_PRIMITIVE_ALL || BUILD_SUM
 #define REG_SUM_P(...) __VA_ARGS__
 #else

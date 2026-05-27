@@ -144,6 +144,10 @@ const alg_kind_t reduction_norm_lp_power_p_sum
         = dnnl_reduction_norm_lp_power_p_sum;
 const alg_kind_t softmax_accurate = dnnl_softmax_accurate;
 const alg_kind_t softmax_log = dnnl_softmax_log;
+const alg_kind_t embedding_bag_sum = dnnl_embedding_bag_sum;
+const alg_kind_t embedding_bag_mean = dnnl_embedding_bag_mean;
+const alg_kind_t embedding_bag_max = dnnl_embedding_bag_max;
+const alg_kind_t embedding_bag_lookup = dnnl_embedding_bag_lookup;
 // Internal only alg kinds.
 const alg_kind_t internal_only_start = (alg_kind_t)(1 << 12);
 // GPU only via jit_eltwise injector.
@@ -2033,6 +2037,7 @@ const primitive_kind_t reduction = dnnl_reduction;
 const primitive_kind_t softmax = dnnl_softmax;
 const primitive_kind_t layer_normalization = dnnl_layer_normalization;
 const primitive_kind_t group_normalization = dnnl_group_normalization;
+const primitive_kind_t embedding_bag = dnnl_embedding_bag;
 
 // Internal only primitive kinds.
 const primitive_kind_t internal_only_start = (primitive_kind_t)(1 << 12);
