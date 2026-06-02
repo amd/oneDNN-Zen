@@ -19,6 +19,7 @@
 #define CPU_CPU_ENGINE_HPP
 
 #include <assert.h>
+#include <iostream>
 
 #include "oneapi/dnnl/dnnl.h"
 
@@ -78,6 +79,7 @@ DECLARE_IMPL_LIST(resampling);
 DECLARE_IMPL_LIST(rnn);
 DECLARE_IMPL_LIST(shuffle);
 DECLARE_IMPL_LIST(softmax);
+DECLARE_IMPL_LIST(sdpa);
 
 #undef DECLARE_IMPL_LIST
 
@@ -114,7 +116,7 @@ public:
             CASE(rnn);
             CASE(shuffle);
             CASE(softmax);
-            case primitive_kind::sdpa: return empty_list;
+            CASE(sdpa);
             case primitive_kind::gated_mlp: return empty_list;
             default: assert(!"unknown primitive kind"); return empty_list;
         }
