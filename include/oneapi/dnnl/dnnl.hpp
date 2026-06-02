@@ -13222,6 +13222,97 @@ struct matmul : public primitive {
 
 /// @} dnnl_api_matmul
 
+/// @addtogroup dnnl_api_sdpa Scaled Dot-Product Attention
+///
+/// A primitive to compute Scaled Dot-Product Attention (SDPA) as a single
+/// fused operation: dst = matmul(softmax(matmul(Q, K^T) * scale + mask), V).
+///
+/// @note This is a PoC public wrapper around the internal SDPA primitive.
+/// The kernel currently prints a message and returns success.
+///
+/// @{
+
+} // namespace dnnl
+
+// Forward declaration of the internal SDPA entry point (lives at global scope).
+// Built into libdnnl with DNNL_API linkage; takes only public C types. Linkage
+// and namespace must match src/common/sdpa_test_iface.hpp exactly to avoid
+// ambiguous-overload errors at existing call sites.
+dnnl_status_t DNNL_API sdpa_primitive_desc_create(
+        dnnl_primitive_desc_t *primitive_desc_iface, dnnl_engine_t engine,
+        const_dnnl_memory_desc_t query_desc, const_dnnl_memory_desc_t key_desc,
+        const_dnnl_memory_desc_t value_desc, const_dnnl_memory_desc_t dst_desc,
+        const_dnnl_memory_desc_t mask_desc, const_dnnl_memory_desc_t scale_desc,
+        bool invert_scale, dnnl_dim_t kv_head_number, int attn_mask_type,
+        dnnl_alg_kind_t softmax_alg, dnnl_prop_kind_t prop,
+        const_dnnl_primitive_attr_t attr, const_dnnl_primitive_attr_t kq_attr,
+        const_dnnl_primitive_attr_t vs_attr);
+
+namespace dnnl {
+
+/// Scaled Dot-Product Attention (SDPA) primitive.
+struct sdpa : public primitive {
+    /// Primitive descriptor for an SDPA primitive.
+    struct primitive_desc : public dnnl::primitive_desc {
+        /// Default constructor. Produces an empty object.
+        primitive_desc() = default;
+
+        /// Constructs a primitive descriptor for an SDPA primitive.
+        ///
+        /// @param aengine Engine to use.
+        /// @param query_desc Memory descriptor for queries (4D: N, H, Sq, D).
+        /// @param key_desc   Memory descriptor for keys    (4D: N, H, Skv, D).
+        /// @param value_desc Memory descriptor for values  (4D: N, H, Skv, D).
+        /// @param dst_desc   Memory descriptor for output  (4D: N, H, Sq, D).
+        /// @param attr       Primitive attributes (optional).
+        /// @param allow_empty Construct empty on failure instead of throwing.
+        primitive_desc(const engine &aengine,
+                const memory::desc &query_desc, const memory::desc &key_desc,
+                const memory::desc &value_desc, const memory::desc &dst_desc,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false) {
+
+            dnnl_primitive_desc_t pd = nullptr;
+            memory::desc empty_md;
+            dnnl_status_t status = ::sdpa_primitive_desc_create(&pd,
+                    aengine.get(), query_desc.get(), key_desc.get(),
+                    value_desc.get(), dst_desc.get(),
+                    /*mask_desc=*/empty_md.get(),
+                    /*scale_desc=*/empty_md.get(),
+                    /*invert_scale=*/false,
+                    /*kv_head_number=*/0,
+                    /*attn_mask_type=*/0 /* undef */,
+                    /*softmax_alg=*/dnnl_softmax_accurate,
+                    /*prop=*/dnnl_forward_inference,
+                    attr.get(), nullptr, nullptr);
+
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a primitive descriptor for the "
+                        "sdpa primitive. Run with ONEDNN_VERBOSE=all for "
+                        "additional diagnostic information.");
+            reset(pd);
+        }
+
+        memory::desc query_desc() const { return query_md(query::src_md, 0); }
+        memory::desc key_desc()   const { return query_md(query::src_md, 1); }
+        memory::desc value_desc() const { return query_md(query::src_md, 2); }
+        memory::desc dst_desc()   const { return query_md(query::dst_md, 0); }
+    };
+
+    /// Default constructor. Produces an empty object.
+    sdpa() = default;
+
+    /// Constructs an SDPA primitive.
+    sdpa(const primitive_desc &pd) : primitive(pd) {}
+
+    /// Constructs an SDPA primitive from a cache blob.
+    sdpa(const primitive_desc &pd, const std::vector<uint8_t> &cache_blob)
+        : primitive(pd, cache_blob) {}
+};
+
+/// @} dnnl_api_sdpa
+
 /// @addtogroup dnnl_api_resampling Resampling
 ///
 /// A primitive to compute resampling operation on 1D, 2D or 3D data tensor
