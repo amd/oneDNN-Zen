@@ -46,9 +46,7 @@ struct ref_sdpa_fwd_t : public primitive_t {
     status_t execute(const exec_ctx_t &ctx) const override;
 
 private:
-    const pd_t *pd() const {
-        return (const pd_t *)primitive_t::pd().get();
-    }
+    const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
 } // namespace cpu

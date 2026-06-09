@@ -1672,10 +1672,13 @@ std::string init_info_sdpa(const engine_t *e, const pd_t *pd) {
 
     delimiter = " ";
     ss << ",alg:" << desc->softmax_alg;
+    // A buffer mask and a causal mask are independent and may both be present,
+    // so report them separately rather than as mutually exclusive.
     if (pd->with_attn_mask()) {
         auto *md = desc->attn_mask_md();
-        ss << delimiter << "msk:buffer_" << (md->dims[2] == 1 ? 1 : 2) << 'd';
-    } else if (pd->with_causal_mask()) {
+        ss << delimiter << "msk:" << (md->dims[2] == 1 ? 1 : 2) << 'd';
+    }
+    if (pd->with_causal_mask()) {
         ss << delimiter;
         if (desc->mask_type == attn_mask_type::top_left)
             ss << "msk:causal_top_left";
