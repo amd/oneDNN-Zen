@@ -13266,9 +13266,9 @@ struct sdpa : public primitive {
         /// @param dst_desc   Memory descriptor for output  (4D: N, H, Sq, D).
         /// @param attr       Primitive attributes (optional).
         /// @param allow_empty Construct empty on failure instead of throwing.
-        primitive_desc(const engine &aengine,
-                const memory::desc &query_desc, const memory::desc &key_desc,
-                const memory::desc &value_desc, const memory::desc &dst_desc,
+        primitive_desc(const engine &aengine, const memory::desc &query_desc,
+                const memory::desc &key_desc, const memory::desc &value_desc,
+                const memory::desc &dst_desc,
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false) {
 
@@ -13283,8 +13283,50 @@ struct sdpa : public primitive {
                     /*kv_head_number=*/0,
                     /*attn_mask_type=*/0 /* undef */,
                     /*softmax_alg=*/dnnl_softmax_accurate,
-                    /*prop=*/dnnl_forward_inference,
-                    attr.get(), nullptr, nullptr);
+                    /*prop=*/dnnl_forward_inference, attr.get(), nullptr,
+                    nullptr);
+
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a primitive descriptor for the "
+                        "sdpa primitive. Run with ONEDNN_VERBOSE=all for "
+                        "additional diagnostic information.");
+            reset(pd);
+        }
+
+        /// Constructs a primitive descriptor for an SDPA primitive with an
+        /// explicit attention-mask configuration.
+        ///
+        /// @param aengine Engine to use.
+        /// @param query_desc Memory descriptor for queries (4D: N, H, Sq, D).
+        /// @param key_desc   Memory descriptor for keys    (4D: N, H, Skv, D).
+        /// @param value_desc Memory descriptor for values  (4D: N, H, Skv, D).
+        /// @param dst_desc   Memory descriptor for output  (4D: N, H, Sq, D).
+        /// @param mask_desc  Memory descriptor for an explicit (additive)
+        ///     attention mask. Pass a default/empty memory::desc when using a
+        ///     causal mask or no mask at all.
+        /// @param attn_mask_type Attention mask type, following
+        ///     dnnl_attn_mask_type_t: 0 = undef/none, 1 = explicit buffer,
+        ///     2 = causal top-left, 3 = causal bottom-right.
+        /// @param attr       Primitive attributes (optional).
+        /// @param allow_empty Construct empty on failure instead of throwing.
+        primitive_desc(const engine &aengine, const memory::desc &query_desc,
+                const memory::desc &key_desc, const memory::desc &value_desc,
+                const memory::desc &dst_desc, const memory::desc &mask_desc,
+                int attn_mask_type, const primitive_attr &attr = default_attr(),
+                bool allow_empty = false) {
+
+            dnnl_primitive_desc_t pd = nullptr;
+            memory::desc empty_md;
+            dnnl_status_t status = ::sdpa_primitive_desc_create(&pd,
+                    aengine.get(), query_desc.get(), key_desc.get(),
+                    value_desc.get(), dst_desc.get(), mask_desc.get(),
+                    /*scale_desc=*/empty_md.get(),
+                    /*invert_scale=*/false,
+                    /*kv_head_number=*/0, attn_mask_type,
+                    /*softmax_alg=*/dnnl_softmax_accurate,
+                    /*prop=*/dnnl_forward_inference, attr.get(), nullptr,
+                    nullptr);
 
             if (!allow_empty)
                 error::wrap_c_api(status,
@@ -13295,9 +13337,9 @@ struct sdpa : public primitive {
         }
 
         memory::desc query_desc() const { return query_md(query::src_md, 0); }
-        memory::desc key_desc()   const { return query_md(query::src_md, 1); }
+        memory::desc key_desc() const { return query_md(query::src_md, 1); }
         memory::desc value_desc() const { return query_md(query::src_md, 2); }
-        memory::desc dst_desc()   const { return query_md(query::dst_md, 0); }
+        memory::desc dst_desc() const { return query_md(query::dst_md, 0); }
     };
 
     /// Default constructor. Produces an empty object.
