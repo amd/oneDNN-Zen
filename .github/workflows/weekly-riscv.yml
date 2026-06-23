@@ -58,7 +58,7 @@ jobs:
 
       # Note: This will create a github actions cache
       - name: Get latest CMake and Ninja
-        uses: lukka/get-cmake@56d043d188c3612951d8755da8f4b709ec951ad6 # v3.31.6
+        uses: lukka/get-cmake@f5b8fbb4d77cec1acc5a5f9f0df4beffaf5d98d9 # v4.3.4
         with:
           cmakeVersion: 3.31.0
           ninjaVersion: 1.12.0
