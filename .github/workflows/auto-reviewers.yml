@@ -1,0 +1,42 @@
+# *******************************************************************************
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Automatically add team reviewers to every PR
+# *******************************************************************************
+
+name: Auto Reviewers
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [zendnn-onednn-integration, zendnn-onednn-sdpa]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  add-reviewers:
+    name: Add Team Reviewers
+    runs-on: [self-hosted, jira_check_runner]
+    steps:
+      - name: Request team reviews
+        env:
+          GH_TOKEN: ${{ secrets.ZIAIE_PAT }}
+        run: |
+          set -euo pipefail
+          
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          
+          echo "Adding team reviewers to PR #${PR_NUMBER}..."
+          
+          # Request review from teams
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -d '{
+              "team_reviewers": ["zenai_leads", "zenai_zendnn_dev"]
+            }' && echo "Team reviewers added successfully" || echo "Failed to add team reviewers (may require org permissions)"
