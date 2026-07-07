@@ -83,8 +83,10 @@ dnnl_status_t init_pd(init_pd_args_t &init_pd_args) {
             default: return 0;
         }
     }(prb->mask_type);
-    dnnl_alg_kind_t softmax_alg = static_cast<dnnl_alg_kind_t>(
-            dnnl::impl::alg_kind::softmax_accurate_inf_as_zero);
+    dnnl_alg_kind_t softmax_alg = is_cpu()
+            ? dnnl_softmax_accurate
+            : static_cast<dnnl_alg_kind_t>(
+                      dnnl::impl::alg_kind::softmax_accurate_inf_as_zero);
 
     // KV head count is always derived from the K tensor's head dimension.
     dnnl_dim_t kv_hn = prb->k_dims()[prb->ndims - 3];
@@ -221,11 +223,26 @@ void prb_t::skip_unimplemented(res_t *res) const {
             {prb->q_dt(), prb->k_dt(), prb->v_dt(), prb->dst_dt()}, prb->dir,
             res);
 
-    // SDPA is currently only implemented for GPU.
     if (is_cpu()) {
-        res->state = SKIPPED;
-        res->reason = reason_t::skip_not_supported;
-        return;
+        const bool fwd_only = prb->dir & FLAG_FWD;
+        const auto q_dt = prb->q_dt();
+        const bool supported_dt = (q_dt == dnnl_f32 || q_dt == dnnl_bf16)
+                && q_dt == prb->k_dt() && q_dt == prb->v_dt()
+                && q_dt == prb->dst_dt();
+        const bool supported_mask = prb->mask_type == MASK_NONE
+                || prb->mask_type == MASK_BUFFER
+                || prb->mask_type == MASK_BUFFER_1D
+                || prb->mask_type == MASK_BUFFER_2D
+                || prb->mask_type == MASK_CAUSAL_TOP_LEFT;
+        const bool supported_scale = prb->scale_type == SCALE_LIBRARY;
+        const bool supported_attr = prb->attr.is_def();
+
+        if (!fwd_only || !supported_dt || !supported_mask || !supported_scale
+                || !supported_attr) {
+            res->state = SKIPPED;
+            res->reason = reason_t::skip_not_supported;
+            return;
+        }
     }
 }
 
