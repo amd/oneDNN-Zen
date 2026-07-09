@@ -5,58 +5,109 @@
 
 ## Introduction
 
-This RFC adds an optimized CPU implementation of grouped matmul (the
-Mixture-of-Experts / variable-`M` batched GEMM) backed by ZenDNN, registered
-behind oneDNN's existing matmul primitive API.
+This RFC adds an optimized CPU implementation of grouped matmul, the
+Mixture-of-Experts (MoE) variable-`M` batched GEMM, backed by ZenDNN and
+registered behind oneDNN's existing matmul primitive.
 
-Grouped matmul is already reachable through a public API: `dnnl::matmul` with
-grouped memory descriptors (`memory::desc::grouped`, gated by
-`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`). What is missing is an optimized CPU
-kernel. On CPU the only implementation today is the correctness-oriented
-reference (`ref_grouped_t`); on GPU there is an optimized Intel path
-(`grouped_micro_gemm_t`). A framework that routes an MoE layer to grouped matmul
-on CPU therefore gets correctness but not performance.
+Grouped matmul already has a public entry point: `dnnl::matmul` with grouped
+memory descriptors (`memory::desc::grouped`, gated by
+`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`), defined in the
+[grouped-GEMM RFC](../20251203-grouped-gemm-support/README.md). What is missing
+is an optimized CPU kernel: today the only CPU implementation is the reference
+`ref_grouped_t`, while the optimized path (`grouped_micro_gemm_t`) exists only on
+Intel GPU. A framework that routes an MoE layer through grouped matmul on CPU
+therefore gets correctness but not performance.
 
-The first PR adds `zen_grouped_matmul_t`, a ZenDNN-backed CPU implementation
-registered ahead of `ref_grouped_t` in the matmul implementation list. It routes
-each expert through ZenDNN's `group_matmul_direct`, declines configurations it does not support, and keeps the reference as a guaranteed fall-through. There are no public API changes.
+The proposal is `zen_grouped_matmul_t`, a ZenDNN-backed CPU implementation
+registered ahead of `ref_grouped_t`. It routes each expert through ZenDNN's
+`group_matmul_direct`, declines configurations it does not support, and leaves
+the reference as the fall-through. It reuses the opt-in `zen64` module from the
+[ZenDNN integration RFC](../20260616-zendnn-integration/README.md); there are no
+public API changes.
 
 ## 1. Motivation
 
-Mixture-of-Experts FFNs are now standard in large models (Mixtral, DeepSeek,
-Qwen-MoE). Their core compute is a grouped matmul: many independent GEMMs that
-share `K`/`N` but have a different, routing-dependent `M` per expert. oneDNN
-exposes this through grouped memory on `dnnl::matmul`, but on CPU only the
-reference kernel exists, which walks experts and elements scalar-wise.
+MoE FFNs are standard in current large models (Mixtral, DeepSeek, Qwen-MoE).
+Their core compute is a grouped matmul: many independent GEMMs that share `K` and
+`N` but have a different, routing-dependent `M` per expert.
 
-The reason to own an optimized CPU path is performance. AMD `zentorch` today
-routes MoE grouped GEMM through ZenDNN's tuned `group_matmul_direct` outside of
-oneDNN for exactly this reason. Registering that kernel as a CPU implementation
-behind the existing grouped-matmul API gives every oneDNN consumer an optimized
-AMD-CPU MoE path with no framework-side integration change and no new public
-surface. This mirrors how ACL plugs in on AArch64 and how the `zen64` module
-plugs in for regular matmul and reorder.
+### Why grouped matmul helps on CPU
 
-The value proposition is a measurable x86 MoE speedup over the current CPU
-grouped path (reference), delivered through ZenDNN's per-expert kernels.
-Benchmark evidence is to be supplied with the PR (see §8).
+The benefit on CPU is not the GPU argument (fewer kernel launches, device-side
+offsets). It is core occupancy: how much independent work is visible to the
+scheduler at one instant. This is the hard case during decode, where `M` is tiny,
+on high-core-count parts (64-128 cores).
+
+- Running one matmul per expert exposes a single small problem at a time. During
+  decode that problem is small and memory-bound; no matter how the library
+  splits it, one expert cannot fill all the cores. The result is a long series of
+  small, latency-bound matmuls run back to back.
+- Grouped matmul processes all experts together, so at any instant there is a
+  much larger pool of independent work to spread across cores and CCD/L3
+  bandwidth, which is exactly what a single small expert lacks. It also amortizes
+  per-call overhead and allows the gated activation to be fused (the intermediate
+  is consumed in place instead of written out and read back).
+
+The right strategy is phase-dependent: prefill has large `M`, so a series of
+matmuls already saturates the cores; decode has tiny `M`, where the grouped
+N-tile path wins by pooling work across experts.
+
+### Evidence
+
+vLLM already carries both paths on CPU: a torch loop with one matmul per expert
+(`forward_torch` to `cpu_fused_moe_torch`) and a grouped-GEMM path
+(`forward_grouped_gemm` to `cpu_fused_moe`) that spreads N-tiles across all
+experts through a shared task counter and fuses the gated activation. It now
+defaults to grouped-GEMM whenever supported and falls back to the torch loop
+otherwise. That grouped path is a hand-written, framework-side kernel.
+
+ZenDNN provides an equivalent Group GEMM op, and our measurements show its
+grouped N-tile path clearly beating the series-of-matmul loop. Decode throughput
+(output tokens/s) on Turin 128-core, input/output length 128:
+
+| Model | Batch | Series of matmul | Grouped N-tile | Speedup |
+|---|---|---|---|---|
+| unsloth/gpt-oss-20b (BF16) | 16 | 157.57 | 198.97 | 1.26x |
+| unsloth/gpt-oss-20b (BF16) | 8  | 109.52 | 134.52 | 1.23x |
+| Qwen/Qwen3-30B-A3B         | 16 | 77.36  | 136.07 | 1.76x |
+| Qwen/Qwen3-30B-A3B         | 8  | 58.58  | 104.49 | 1.78x |
+
+The gain is largest on the smaller, more skewed expert workload
+(Qwen3-30B-A3B, ~1.8x), which is where a series of small matmuls leaves cores
+idle.
+
+### Why this belongs in the library
+
+- Reuse: it plugs into oneDNN's existing microkernels, scratchpad, and threading
+  instead of reimplementing tiling by hand.
+- One implementation, many consumers: vLLM hand-rolls this today, and llama.cpp
+  and others would each need their own. A library op lets them share one tuned
+  path.
+- Transparent dispatch: under `zen64` it registers ahead of the reference with a
+  runtime AMD/Zen4+ check and falls back everywhere else, with no API change and
+  no non-AMD regression.
+
+The ask is narrow: enable a ZenDNN-backed grouped matmul for AMD under the
+ongoing `zen64` integration, using the grouped-matmul API oneDNN already exposes.
+Routing the vLLM MoE op to this path, along with end-to-end validation and
+cross-vendor discussion, can proceed with the vLLM community on its own timeline.
 
 ## 2. Non-Goals
 
-- Do not replace `ref_grouped_t`; it stays as the portable fallback and the
-  coverage for configurations ZenDNN declines.
-- Do not add a new public API or new primitive; this is an implementation behind
-  the existing grouped matmul, and the grouped-memory API is unchanged.
-- Do not add f16, quantization (scales / zero-points / WoQ), fused gated
-  activations, or MoE weighted-reduce in the first PR; these are declined at
+### Non-Goals
+- Replacing `ref_grouped_t`. It stays as the portable fallback.
+- New public API or a new primitive. This is an implementation behind the
+  existing grouped matmul.
+- f16, quantization (scales / zero-points / weight-only), fused gated
+  activations, and MoE weighted-reduce in the first PR. These are declined at
   dispatch and left to follow-ups.
-- Do not change the Intel GPU grouped path (`grouped_micro_gemm_t`).
+- The Intel GPU grouped path (`grouped_micro_gemm_t`), which is untouched.
 
-## 3. Proposal - ZenDNN-backed grouped matmul
+## 3. Proposal
 
-The design reuses the existing grouped-matmul API and the `zen64` module. It adds
-one CPU implementation-list entry and the CPU kernel; consumers keep calling
-`dnnl::matmul` with grouped memory and are unaffected when the module is off.
+The design reuses the grouped-matmul API and the `zen64` module. It adds one CPU
+implementation-list entry plus the kernel; a consumer keeps calling
+`dnnl::matmul` with grouped memory and is unaffected when the module is off.
 
 ### 3.1 Architecture overview
 
@@ -69,9 +120,9 @@ one CPU implementation-list entry and the CPU kernel; consumers keep calling
 │  Primitive APIs   dnnl::matmul (grouped)                          │
 │  Engines          CPU · GPU · XPU · Graph                         │
 │  Architectures    x64 · aarch64 · riscv64 · ppc64 · s390x         │
-│                              |                                    │
-│                      matmul impl_list                             │
-│                              |                                    │
+│                                                                   │
+│  matmul impl_list   each impl tried in order until one accepts    │
+│                                                                   │
 │         ╔═══════════════════════════════════════════════╗         │
 │         ║ zen_grouped_matmul_t   (NEW, opt-in)          ║         │
 │         ║   src/cpu/x64/zen64/matmul/                   ║         │
@@ -87,8 +138,8 @@ one CPU implementation-list entry and the CPU kernel; consumers keep calling
 │         ╚═══════════════════════╤═══════════════════════╝         │
 │                      ┌──────────┴──────────┐                      │
 │                      │ success             │ unimplemented        │
-│                      |                     ▼                      │
-│                      |             ┌───────────────┐              │
+│                      ▼                     ▼                      │
+│             group_matmul_direct    ┌───────────────┐              │
 │                      │             │ ref_grouped_t │              │
 │                      │             │  (reference)  │              │
 │                      │             └───────────────┘              │
@@ -103,9 +154,11 @@ one CPU implementation-list entry and the CPU kernel; consumers keep calling
              └──────────────────────────┘
 ```
 
-Gating is build-time (`DNNL_X64_USE_ZEN=ON`, default OFF) plus the existing
-`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`. Runtime dispatch is decided in
-`pd_t::init()` by CPU detection (AMD gate), with no environment variable.
+Gating follows the `zen64` module unchanged (see the ZenDNN integration RFC,
+§3.2-3.5): build-time `DNNL_X64_USE_ZEN=ON` (default OFF), plus the existing
+`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`, and a runtime AMD + AVX-512 check inside
+`pd_t::init()` with no environment variable. The only addition here is the
+grouped feature flag on the registration macro.
 
 ### 3.2 Operation semantics
 
@@ -115,97 +168,97 @@ For `g = 0 .. G-1`, with per-expert row count `M_g` derived from the offsets:
 dst_g[M_g, N] = src_g[M_g, K] · W_g[K, N]  (+ bias_g[N])  (+ post-ops)
 ```
 
-`src`/`dst` are slices of the concatenated buffers; `W_g` is `weights[g]`.
+`src` and `dst` are slices of the concatenated grouped buffers; `W_g` is
+`weights[g]`.
 
-### 3.3 CPU registration and kernel
+### 3.3 CPU registration
 
-`zen_grouped_matmul_t` is added under
+`zen_grouped_matmul_t` lives at
 `src/cpu/x64/zen64/matmul/zen_grouped_matmul.{hpp,cpp}` (namespace
 `dnnl::impl::cpu::x64::zen::matmul`), including ZenDNN headers under
-`#if DNNL_X64_USE_ZEN`, following the existing `zen_matmul_t` convention. A new
-macro `CPU_INSTANCE_X64_ZEN_GROUPED(...)` in `src/cpu/cpu_engine.hpp` is
+`#if DNNL_X64_USE_ZEN`, following the existing `zen_matmul_t`. A new macro
+`CPU_INSTANCE_X64_ZEN_GROUPED(...)` in `src/cpu/cpu_engine.hpp` is
 `CPU_INSTANCE_X64_ZEN(...)` additionally gated on
-`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`, and it is registered in
+`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`, registered in
 `src/cpu/matmul/cpu_matmul_list.cpp` immediately before
-`CPU_INSTANCE_GROUPED(ref_grouped_t)`. Build wiring reuses the `zen64` module's
-`cmake/ZenDNN.cmake`; `zen64` sources compile with ZenDNN include dirs scoped
-per-target, with no global include changes. Unsupported cases return
-`unimplemented` so dispatch falls through to `ref_grouped_t`.
+`CPU_INSTANCE_GROUPED(ref_grouped_t)`. Build wiring reuses the module's
+`cmake/ZenDNN.cmake` with no global include changes. Unsupported cases return
+`status::unimplemented`, so dispatch falls through to `ref_grouped_t`.
 
 ### 3.4 Data-model bridge
 
-oneDNN stores grouped tensors concatenated with offsets; ZenDNN's
-`group_matmul_direct` takes per-group pointer/shape vectors. `execute()`:
+oneDNN stores grouped tensors as concatenated values plus an `s32` offsets buffer
+(see the grouped-GEMM RFC); ZenDNN's `group_matmul_direct` takes per-group
+pointer and shape vectors. `execute()` bridges the two:
 
-- reads `src` values (buffer 0) and `s32` offsets (buffer 1), `dst` values and
-  offsets, dense weights, and optional bias;
-- resolves weight orientation from strides: `abc` → `transB=false, ldb=N`;
-  `acb` (stored `[N,K]`) → `transB=true, ldb=K`;
-- for each expert `g`, computes `M_g = offsets[g] - offsets[g-1]` and base
+- reads `src` values and offsets, `dst` values and offsets, dense weights, and
+  optional bias;
+- resolves weight orientation from strides: `abc` gives `transB=false, ldb=N`;
+  `acb` (stored `[N,K]`) gives `transB=true, ldb=K`;
+- for each expert, computes `M_g = offsets[g] - offsets[g-1]` and the base
   pointers into the concatenated buffers, skipping empty experts (`M_g == 0`);
 - fills the per-group vectors and calls `group_matmul_direct` once.
 
-### 3.5 Data-type and post-op support
+### 3.5 Data types and post-ops
 
-Aligned with `zen_matmul_t`: uniform f32, uniform bf16, and bf16→f32 (bf16
-src/wei, f32 dst). f16 is excluded (requires AVX-512-FP16, absent on the Zen
-target); all other dtypes (int8 / WoQ) are declined.
+Data-type coverage matches `zen_matmul_t`: uniform f32, uniform bf16, and bf16 to
+f32 (bf16 src/weights, f32 dst). f16 is excluded (it needs AVX-512-FP16, absent
+on the Zen target); int8 and weight-only quantization are declined.
 
-Supported post-ops, validated per entry (unsupported chains fall back to the
+Supported post-ops, validated per entry (an unsupported chain falls back to the
 reference):
 
-- eltwise: relu, gelu_tanh, gelu_erf, tanh, sigmoid (logistic), swish;
-- binary: add, mul with concrete `[1, N]` src1 (broadcast over `M`);
+- eltwise: relu, gelu_tanh, gelu_erf, tanh, sigmoid, swish;
+- binary: add, mul with a concrete `[1, N]` src1 broadcast over `M`;
 - sum, mapped to ZenDNN `beta` accumulation.
 
-The chain is pre-built once per primitive (mirroring `zen_matmul_t`'s
+The chain is built once per primitive (as in `zen_matmul_t`'s
 `postop_template_`); binary buffer pointers are patched per call.
 
-## 4. PoC - end-to-end and accuracy
+## 4. Proof of Concept and Validation
 
-The path was validated end-to-end via `dnnl::matmul` with grouped memory,
-dispatching to ZenDNN on AMD x86 with the module enabled.
+A working PoC dispatches `dnnl::matmul` with grouped memory to ZenDNN on AMD when
+the module is enabled, and is validated for accuracy through benchdnn.
 
 ### 4.1 Verbose evidence
 
 ```
-onednn_verbose,v1,primitive,exec,cpu,matmul,zen:grouped:f32|bf16:amd,undef,
-  src:f32::sparse:grouped::f0 wei:f32::blocked:abc::f0 dst:f32::sparse:grouped::f0,
-  attr-post-ops:eltwise_relu,,32x64:4x64x32, ...
+onednn_verbose,v1,primitive,exec,cpu,matmul,zen:grouped_matmul,undef,src:f32::sparse:grouped::f0 wei:f32::blocked:acb::f0 dst:f32::sparse:grouped::f0,,,16x32:3x32x24,77.665
 ```
 
-`zen:grouped:f32|bf16:amd` confirms the ZenDNN impl ran; the grouped `src`/`dst`,
-dense `abc` weights, and the applied post-op are visible.
+`zen:grouped_matmul` confirms the ZenDNN implementation ran. The grouped
+`src`/`dst` and the dense `acb` weights are visible; `16x32:3x32x24` is 3 experts
+sharing `K=32`, `N=24` over 16 total rows.
 
 ### 4.2 Accuracy
-TODO
+
+The path is validated across the benchdnn grouped inputs, benchdnn runs in
+correctness mode, building an independent reference and comparing within dtype
+tolerances; supported configurations dispatch to the ZenDNN implementation and
+pass, while unsupported ones fall back to `ref_grouped_t` and pass.
 
 ## 5. Framework-Side Changes
 
-None required beyond what already routes to grouped matmul. A framework that
-issues an MoE layer as `dnnl::matmul` with grouped memory automatically gets the
-ZenDNN path when the module is enabled on AMD x86, and the reference otherwise.
-Applications need no source changes.
+None beyond what already routes to grouped matmul. A framework that issues an MoE
+layer as `dnnl::matmul` with grouped memory gets the ZenDNN path automatically
+when the module is enabled on AMD, and the reference otherwise. Applications need
+no source changes.
 
 ## 6. First PR - Scope and Acceptance Criteria
 
-The first PR is complete when the following are in place and passing on CPU:
+The first PR is complete when the following hold on CPU:
 
 - `zen_grouped_matmul_t` and the `CPU_INSTANCE_X64_ZEN_GROUPED` registration are
-  in place ahead of `ref_grouped_t`; with `DNNL_X64_USE_ZEN=ON` and
-  `ONEDNN_EXPERIMENTAL_GROUPED_MEMORY=ON` on AMD, a grouped f32/bf16 matmul
-  appears in verbose as `zen:grouped:...`.
-- Coverage of f32 / bf16 / bf16→f32, `abc`/`acb` weights, per-expert bias, and
-  the eltwise/binary/sum post-ops of §3.5 passes benchdnn correctness across the
-  sweep in §4.2.
-- The default build (`DNNL_X64_USE_ZEN=OFF`) is unaffected with no public header
-  changes; existing `test_iface_grouped` and the grouped benchdnn inputs pass
-  with the module off.
-- gtests cover the Zen grouped path (guarded, AMD-only, single-threaded),
-  comparing against an in-test reference and asserting the impl name.
+  in place ahead of `ref_grouped_t`. With `DNNL_X64_USE_ZEN=ON` and
+  `ONEDNN_EXPERIMENTAL_GROUPED_MEMORY=ON` on AMD, a grouped f32/bf16 matmul shows
+  `zen:grouped_matmul` in verbose.
+- gtests coverage of f32, bf16, and bf16 to f32; `abc`/`acb` weights; per-expert bias;
+  and the eltwise/binary/sum post-ops.
+- The default build (`DNNL_X64_USE_ZEN=OFF`) is unaffected, with no public header
+  changes; `test_iface_grouped` and the grouped benchdnn inputs pass with the
+  module off.
 
-Follow-up work includes multi-threaded enablement, benchmark-driven perf
-validation, f16, quantization, and fused gated activations.
+Follow-up work: benchmark-driven perf validation, f16, quantization, and fused gated activations.
 
 ## 7. Alternatives Considered
 
@@ -219,7 +272,7 @@ validation, f16, quantization, and fused gated activations.
 
 ## 8. Open Questions
 
-- Gated activations: ZenDNN offers fused gated activations (`silu_and_mul` /
-  `gelu_and_mul` / `swiglu`), but oneDNN's investigation favors extending binary
-  post-op with in-place multiply over a dedicated gated attribute. Follow-up
-  should align with that direction.
+- Gated activations: ZenDNN offers fused `silu_and_mul` / `gelu_and_mul` /
+  `swiglu`, but oneDNN's investigation favors extending binary post-op with an
+  in-place multiply over a dedicated attribute. Follow-up should align with that
+  direction.
