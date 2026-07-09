@@ -61,24 +61,46 @@ one CPU implementation-list entry and the CPU kernel; consumers keep calling
 ### 3.1 Architecture overview
 
 ```
-framework (PyTorch / zentorch / vLLM MoE)
-        │  Primitive API (unchanged)
-        ▼
-dnnl::matmul(pd) with grouped src/dst + dense 3D weights
-        │  → dnnl_matmul_primitive_desc_create
-        │    → grouped_matmul_desc_init   [ONEDNN_EXPERIMENTAL_GROUPED_MEMORY]
-        ▼  walk CPU matmul impl_list
-   ┌──────────────────────────────────────────────┐
-   │ CPU_INSTANCE_X64_ZEN_GROUPED(zen_grouped_matmul_t)  ← new, tried first
-   │   AMD CPU · grouped src/dst · dense 3D [G,K,N]
-   │   f32 / bf16 / bf16→f32 · supported post-ops
-   └──────────────────────────────────────────────┘
-        │ success                         │ unimplemented
-        ▼                                 ▼
-   zen_grouped_matmul_t              CPU_INSTANCE_GROUPED(ref_grouped_t)
-        │  execute(): per-expert vectors → ZenDNN
-        ▼
-   group_matmul_direct(...)   [AOCL-DLP / ZenDNN native kernel]
+   framework  (PyTorch · Zentorch · vLLM · …)
+                                  │  MoE layer → dnnl::matmul (grouped memory)
+                                  ▼
+┌───────────────────────── oneDNN Library ──────────────────────────┐
+│                                                                   │
+│  Primitive APIs   dnnl::matmul (grouped)                          │
+│  Engines          CPU · GPU · XPU · Graph                         │
+│  Architectures    x64 · aarch64 · riscv64 · ppc64 · s390x         │
+│                              |                                    │
+│                      matmul impl_list                             │
+│                              |                                    │
+│         ╔═══════════════════════════════════════════════╗         │
+│         ║ zen_grouped_matmul_t   (NEW, opt-in)          ║         │
+│         ║   src/cpu/x64/zen64/matmul/                   ║         │
+│         ║                                               ║         │
+│         ║   build:    DNNL_X64_USE_ZEN=ON               ║         │
+│         ║             + EXPERIMENTAL_GROUPED_MEMORY     ║         │
+│         ║   runtime:  AMD vendor + AVX-512              ║         │
+│         ║                                               ║         │
+│         ║   • registered ahead of ref_grouped_t         ║         │
+│         ║   • PD::init() validation gate                ║         │
+│         ║   • grouped src/dst · dense 3D [G,K,N]        ║         │
+│         ║   • f32 / bf16 / bf16→f32 · post-ops          ║         │
+│         ╚═══════════════════════╤═══════════════════════╝         │
+│                      ┌──────────┴──────────┐                      │
+│                      │ success             │ unimplemented        │
+│                      |                     ▼                      │
+│                      |             ┌───────────────┐              │
+│                      │             │ ref_grouped_t │              │
+│                      │             │  (reference)  │              │
+│                      │             └───────────────┘              │
+└──────────────────────┼────────────────────────────────────────────┘
+                       │  group_matmul_direct(…) per expert
+                       ▼
+             ┌──────────────────────────┐
+             │      ZenDNN library      │
+             │  (linked when build      │
+             │   flag is ON, default    │
+             │   OFF)                   │
+             └──────────────────────────┘
 ```
 
 Gating is build-time (`DNNL_X64_USE_ZEN=ON`, default OFF) plus the existing
@@ -155,20 +177,8 @@ onednn_verbose,v1,primitive,exec,cpu,matmul,zen:grouped:f32|bf16:amd,undef,
 `zen:grouped:f32|bf16:amd` confirms the ZenDNN impl ran; the grouped `src`/`dst`,
 dense `abc` weights, and the applied post-op are visible.
 
-### 4.2 Accuracy (benchdnn)
-
-benchdnn runs in correctness mode against an independent reference. A
-representative sweep (3 shapes including empty/unbalanced groups × {f32, bf16,
-bf16→f32, f16} × {abc, acb} × {relu, gelu_tanh, gelu_erf, tanh, logistic, swish,
-binary-mul}):
-
-```
-TOTAL passed=168 failed=0 | dispatched zen=126 ref=42
-```
-
-126 problems computed by ZenDNN pass accuracy validation; the 42 f16 problems
-correctly fall back to `ref_grouped_t` and pass. Runs are single-threaded (see
-§8 for the threading caveat).
+### 4.2 Accuracy
+TODO
 
 ## 5. Framework-Side Changes
 
