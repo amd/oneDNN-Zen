@@ -36,12 +36,18 @@ namespace cpu {
 //
 //   O = softmax( (Q * K^T) * scale , dim=Skv ) * V
 //
-// Tensor layout. The SDPA contract gives K the logical shape (N, H, D, Skv)
+// Tensor layout. The SDPA contract gives K the logical shape (N, Hkv, D, Skv)
 // (head-size axis before Skv), so scores = Q * K is a plain matmul:
-//   Q : (N, H, Sq,  D)    queries
-//   K : (N, H, D,   Skv)  keys (logical)
-//   V : (N, H, Skv, D)    values
-//   O : (N, H, Sq,  D)    output
+//   Q : (N, Hq,  Sq,  D)    queries
+//   K : (N, Hkv, D,   Skv)  keys (logical)
+//   V : (N, Hkv, Skv, D)    values
+//   O : (N, Hq,  Sq,  D)    output
+//
+// Grouped/Multi-Query Attention (GQA/MQA). Q may have more heads than K/V:
+// Hq is a multiple of Hkv. Each K/V head is shared by a contiguous group of
+// Hq / Hkv query heads, so query head h reads K/V head h / (Hq / Hkv). Plain
+// multi-head attention is the Hq == Hkv case (group size 1) and MQA is the
+// Hkv == 1 case; all three go through the same head-mapping path.
 //
 // Layouts are fully stride-driven. Every axis of every tensor is addressed
 // through its memory-descriptor stride, so dense, transposed (BHSD / BHDS
@@ -172,22 +178,27 @@ static void attend_single_query(const T *q, const T *k, const T *v, T *o,
 
 // Top-level driver: walks every (n, h, sq), locating each tensor's row/head
 // base via its strides, so dense, transposed, and packed layouts all work.
+// GQA/MQA: Hq query heads share Hkv < Hq key/value heads, so query head h
+// reads K/V head h / (Hq / Hkv); Hq == Hkv reduces to plain multi-head.
 template <typename T>
 static void sdpa_forward_ref(const T *Q, const T *K, const T *V, T *O, int N,
-        int H, int Sq, int Skv, int D, float scale, const qkvo_strides_t &st,
-        const ref_mask_t &mk) {
+        int Hq, int Hkv, int Sq, int Skv, int D, float scale,
+        const qkvo_strides_t &st, const ref_mask_t &mk) {
 
+    const int group = Hq / Hkv; // query heads sharing one K/V head (>= 1)
     for (int n = 0; n < N; ++n)
-        for (int h = 0; h < H; ++h)
+        for (int h = 0; h < Hq; ++h) {
+            const int h_kv = h / group;
             for (int sq = 0; sq < Sq; ++sq) {
                 const T *q = Q + n * st.q_n + h * st.q_h + sq * st.q_s;
-                const T *k = K + n * st.k_n + h * st.k_h;
-                const T *v = V + n * st.v_n + h * st.v_h;
+                const T *k = K + n * st.k_n + h_kv * st.k_h;
+                const T *v = V + n * st.v_n + h_kv * st.v_h;
                 T *o = O + n * st.o_n + h * st.o_h + sq * st.o_s;
 
                 attend_single_query(
                         q, k, v, o, Skv, D, scale, st, mk, n, h, sq);
             }
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +214,19 @@ status_t ref_sdpa_fwd_t::pd_t::init(engine_t *engine) {
     VDISPATCH_SDPA(d->q_desc.ndims == 4 && d->k_desc.ndims == 4
                     && d->v_desc.ndims == 4 && d->dst_desc.ndims == 4,
             "ref_sdpa: expected 4D Q/K/V/dst");
+
+    // Heads: K and V must share the same head count (Hkv); GQA/MQA is allowed
+    // as long as the query head count (Hq) is a positive multiple of Hkv, so
+    // each K/V head maps to a whole group of query heads. Hq == Hkv is plain
+    // multi-head attention; Hkv == 1 is MQA.
+    const dim_t Hq = d->q_desc.dims[1];
+    const dim_t Hkv = d->k_desc.dims[1];
+    VDISPATCH_SDPA(d->v_desc.dims[1] == Hkv,
+            "ref_sdpa: K and V must have the same number of heads");
+    VDISPATCH_SDPA(d->dst_desc.dims[1] == Hq,
+            "ref_sdpa: dst head count must match query head count");
+    VDISPATCH_SDPA(Hkv > 0 && Hq % Hkv == 0,
+            "ref_sdpa: query heads must be a multiple of key/value heads");
 
     // Datatype: f32 or bf16, but uniform across all tensors. bf16 is handled by
     // up-converting to f32 for the math core (see execute()).
@@ -245,9 +269,11 @@ status_t ref_sdpa_fwd_t::pd_t::init(engine_t *engine) {
 status_t ref_sdpa_fwd_t::execute(const exec_ctx_t &ctx) const {
     const auto *d = pd()->desc();
 
-    // Shapes. K is logically (N, H, D, Skv), so Skv is its LAST dim; D is Q's.
+    // Shapes. K is logically (N, Hkv, D, Skv), so Skv is its LAST dim; D is
+    // Q's. Hq (query heads) may exceed Hkv (key/value heads) for GQA/MQA.
     const int N = static_cast<int>(d->q_desc.dims[0]);
-    const int H = static_cast<int>(d->q_desc.dims[1]);
+    const int Hq = static_cast<int>(d->q_desc.dims[1]);
+    const int Hkv = static_cast<int>(d->k_desc.dims[1]);
     const int Sq = static_cast<int>(d->q_desc.dims[2]);
     const int D = static_cast<int>(d->q_desc.dims[3]);
     const int Skv = static_cast<int>(d->k_desc.dims[3]);
@@ -307,14 +333,14 @@ status_t ref_sdpa_fwd_t::execute(const exec_ctx_t &ctx) const {
         sdpa_forward_ref<float>(CTX_IN_MEM(const float *, DNNL_ARG_QUERIES),
                 CTX_IN_MEM(const float *, DNNL_ARG_KEYS),
                 CTX_IN_MEM(const float *, DNNL_ARG_VALUES),
-                CTX_OUT_MEM(float *, DNNL_ARG_DST), N, H, Sq, Skv, D, scale, st,
-                mk);
+                CTX_OUT_MEM(float *, DNNL_ARG_DST), N, Hq, Hkv, Sq, Skv, D,
+                scale, st, mk);
     } else { // bf16
         sdpa_forward_ref<bfloat16_t>(
                 CTX_IN_MEM(const bfloat16_t *, DNNL_ARG_QUERIES),
                 CTX_IN_MEM(const bfloat16_t *, DNNL_ARG_KEYS),
                 CTX_IN_MEM(const bfloat16_t *, DNNL_ARG_VALUES),
-                CTX_OUT_MEM(bfloat16_t *, DNNL_ARG_DST), N, H, Sq, Skv, D,
+                CTX_OUT_MEM(bfloat16_t *, DNNL_ARG_DST), N, Hq, Hkv, Sq, Skv, D,
                 scale, st, mk);
     }
     return status::success;
