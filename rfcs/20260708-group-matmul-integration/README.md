@@ -94,7 +94,6 @@ cross-vendor discussion, can proceed with the vLLM community on its own timeline
 
 ## 2. Non-Goals
 
-### Non-Goals
 - Replacing `ref_grouped_t`. It stays as the portable fallback.
 - New public API or a new primitive. This is an implementation behind the
   existing grouped matmul.
@@ -113,22 +112,18 @@ implementation-list entry plus the kernel; a consumer keeps calling
 
 ```
    framework  (PyTorch · Zentorch · vLLM · …)
-                                  │  MoE layer → dnnl::matmul (grouped memory)
+                                  │  MoE layer → grouped memory descriptor
                                   ▼
 ┌───────────────────────── oneDNN Library ──────────────────────────┐
 │                                                                   │
-│  Primitive APIs   dnnl::matmul (grouped)                          │
-│  Engines          CPU · GPU · XPU · Graph                         │
-│  Architectures    x64 · aarch64 · riscv64 · ppc64 · s390x         │
-│                                                                   │
-│  matmul impl_list   each impl tried in order until one accepts    │
+│  dnnl::matmul (grouped) dispatches through the matmul impl_list — │
 │                                                                   │
 │         ╔═══════════════════════════════════════════════╗         │
 │         ║ zen_grouped_matmul_t   (NEW, opt-in)          ║         │
 │         ║   src/cpu/x64/zen64/matmul/                   ║         │
 │         ║                                               ║         │
-│         ║   build:    DNNL_X64_USE_ZEN=ON               ║         │
-│         ║             + EXPERIMENTAL_GROUPED_MEMORY     ║         │
+│         ║   build:  DNNL_X64_USE_ZEN=ON                 ║         │
+│         ║           + ONEDNN_EXPERIMENTAL_GROUPED_MEMORY║         │
 │         ║   runtime:  AMD vendor + AVX-512              ║         │
 │         ║                                               ║         │
 │         ║   • registered ahead of ref_grouped_t         ║         │
@@ -223,7 +218,9 @@ the module is enabled, and is validated for accuracy through benchdnn.
 ### 4.1 Verbose evidence
 
 ```
-onednn_verbose,v1,primitive,exec,cpu,matmul,zen:grouped_matmul,undef,src:f32::sparse:grouped::f0 wei:f32::blocked:acb::f0 dst:f32::sparse:grouped::f0,,,16x32:3x32x24,77.665
+onednn_verbose,v1,primitive,exec,cpu,matmul,zen:grouped_matmul,undef,
+  src:f32::sparse:grouped::f0 wei:f32::blocked:acb::f0 dst:f32::sparse:grouped::f0,
+  ,,16x32:3x32x24,77.665
 ```
 
 `zen:grouped_matmul` confirms the ZenDNN implementation ran. The grouped
