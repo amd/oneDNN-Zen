@@ -76,6 +76,17 @@ The gain is largest on the smaller, more skewed expert workload
 (Qwen3-30B-A3B, ~1.8x), which is where a series of small matmuls leaves cores
 idle.
 
+The same effect shows up end to end in vLLM. Decode throughput (output tokens/s)
+for the vLLM native path vs the ZenDNN-accelerated (`zentorch`) path, batch 32,
+input/output length 128:
+
+| Model | Native (tok/s) | ZenDNN (tok/s) | Speedup |
+|---|---|---|---|
+| gpt-oss-20b-BF16            | 284.41 | 344.72 | 1.21x |
+| Mixtral-8x7B-Instruct-v0.1  | 93.94  | 112.83 | 1.20x |
+| Qwen3-30B-A3B-Instruct-2507 | 235.06 | 250.53 | 1.07x |
+| Qwen3-30B-A3B               | 229.43 | 235.67 | 1.03x |
+
 ### Why this belongs in the library
 
 - Reuse: it plugs into oneDNN's existing microkernels, scratchpad, and threading
