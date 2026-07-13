@@ -157,7 +157,7 @@ when the module is off.
 │         ║   runtime:  AMD vendor + AVX-512              ║         │
 │         ║                                               ║         │
 │         ║   • registered ahead of ref_grouped_t         ║         │
-│         ║   • PD::init() validation gate                ║         │
+│         ║   • pd_t::init() validation gate               ║         │
 │         ║   • grouped src/dst · dense 3D [G,K,N]        ║         │
 │         ║   • f32 / bf16 / bf16→f32 · post-ops          ║         │
 │         ╚═══════════════════════╤═══════════════════════╝         │
@@ -179,11 +179,10 @@ when the module is off.
              └──────────────────────────┘
 ```
 
-Gating follows the `zen64` module unchanged (see the ZenDNN integration RFC,
-§3.2-3.5): build-time `DNNL_X64_USE_ZEN=ON` (default OFF), plus the existing
-`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`, and a runtime AMD + AVX-512 check inside
-`pd_t::init()` with no environment variable. The only addition here is the
-grouped feature flag on the registration macro.
+Gating follows the `zen64` module unchanged: build-time `DNNL_X64_USE_ZEN=ON`
+(default OFF), plus the existing `ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`, and a
+runtime AMD + AVX-512 check inside `pd_t::init()` with no environment variable.
+The only addition here is the grouped feature flag on the registration macro.
 
 ### 3.2 Operation semantics
 
