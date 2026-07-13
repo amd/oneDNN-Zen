@@ -19,10 +19,10 @@ Intel GPU. A framework that routes an MoE layer through grouped matmul on CPU
 therefore gets correctness but not performance.
 
 The proposal is `zen_grouped_matmul_t`, a ZenDNN-backed CPU implementation
-registered ahead of `ref_grouped_t`. It routes each expert through ZenDNN's
-`group_matmul_direct`, declines configurations it does not support, and leaves
-the reference as the fall-through. It reuses the opt-in `zen64` module from the
-[ZenDNN integration RFC](../20260616-zendnn-integration/README.md); there are no
+registered ahead of `ref_grouped_t` (mechanism in
+[§3.3](#33-cpu-registration)). It reuses the opt-in
+`zen64` module from the
+[ZenDNN integration RFC](../20260616-zendnn-integration/README.md) and adds no
 public API changes.
 
 ## 1. Motivation
@@ -56,15 +56,14 @@ experts through a shared task counter and fuses the gated activation. It now
 defaults to grouped-GEMM whenever supported and falls back to the torch loop
 otherwise. That grouped path is a hand-written, framework-side kernel.
 
-ZenDNN provides an equivalent Group GEMM op. In our measurements its N-tile
-grouped path is consistently faster than the series-of-matmul loop. All numbers
-below are on AMD Turin (128 cores, 128 threads).
+ZenDNN provides an equivalent Group GEMM op that is consistently faster than the
+series-of-matmul loop. The tables below show this at three levels: at the GEMM-op
+and model-decode levels we compare the two ZenDNN kernels (series-of-matmul vs
+N-tile grouped), and end to end in vLLM we compare the native path against the
+ZenDNN-accelerated (`zentorch`) path. All numbers are on AMD Turin (128 cores, 128 threads).
 
-This shows up most clearly at the op level. We measured MoE GEMM sweeps (bf16,
-`K=2880`, `N=5760`, top-k 4) where the number of GEMM ops per step depends on
-routing. Grouping the runs by that op count, the table below gives how much
-faster the N-tile grouped kernel is than the series-of-matmul loop in decode
-(higher is better):
+At the op level, MoE GEMM sweeps (bf16, `K=2880`, `N=5760`, top-k 4) are bucketed
+by the GEMM op count per decode step, which varies with routing:
 
 | Op count / step | BS8 | BS16 | BS32 |
 |---|---|---|---|
@@ -72,12 +71,10 @@ faster the N-tile grouped kernel is than the series-of-matmul loop in decode
 | medium (11-20) | 2.8x | 2.4x | 2.4x |
 | large (>=21)   | 1.9x | 1.8x | 1.9x |
 
-The grouped kernel wins most at small and medium op counts (~2.2-2.8x) and still
-holds ~1.8-1.9x at large counts, consistent with the point above: pooling experts
-helps most when each expert is tiny.
+The grouped kernel is ~2.2-2.8x faster at small and medium op counts and
+~1.8-1.9x at large counts: pooling experts helps most when each expert is tiny.
 
-This carries through to model throughput. Decode throughput (output tokens/s),
-input/output length 128:
+At the model level, decode throughput (output tokens/s, input/output length 128):
 
 | Model | Batch | Series of matmul | Grouped N-tile | Speedup |
 |---|---|---|---|---|
@@ -90,9 +87,8 @@ The gain is largest on the smaller, more skewed expert workload
 (Qwen3-30B-A3B, ~1.8x), which is where a series of small matmuls leaves cores
 idle.
 
-The same effect shows up end to end in vLLM. Decode throughput (output tokens/s)
-for the vLLM native path vs the ZenDNN-accelerated (`zentorch`) path, batch 32,
-input/output length 128:
+End to end in vLLM, decode throughput for the native path vs the
+ZenDNN-accelerated (`zentorch`) path, batch 32:
 
 | Model | Native (tok/s) | ZenDNN (tok/s) | Speedup |
 |---|---|---|---|
@@ -103,17 +99,6 @@ input/output length 128:
 
 These gains are available today through the `zentorch` vLLM plugin, which calls
 ZenDNN directly.
-
-### Why this belongs in the library
-
-- Reuse: it plugs into oneDNN's existing microkernels, scratchpad, and threading
-  instead of reimplementing tiling by hand.
-- One implementation, many consumers: vLLM hand-rolls this today, and llama.cpp
-  and others would each need their own. A library op lets them share one tuned
-  path.
-- Transparent dispatch: under `zen64` it registers ahead of the reference and is
-  selected only on supported AMD systems, falling back everywhere else with no
-  non-AMD regression.
 
 The ask is narrow: enable a ZenDNN-backed grouped matmul for AMD under the
 ongoing `zen64` integration, using the grouped-matmul API oneDNN already exposes.
@@ -141,7 +126,7 @@ when the module is off.
 ### 3.1 Architecture overview
 
 ```
-   framework  (PyTorch · llma.cpp · vLLM · …)
+   framework  (PyTorch · llama.cpp · vLLM · …)
                                   │  MoE layer → grouped memory descriptor
                                   ▼
 ┌───────────────────────── oneDNN Library ──────────────────────────┐
@@ -172,7 +157,7 @@ when the module is off.
                        │  group_matmul_direct(…) (per-expert vectors)
                        ▼
                 ┌───────────────────┐
-                |  ZenDNN library   │
+                │  ZenDNN library   │
                 └───────────────────┘
 ```
 
