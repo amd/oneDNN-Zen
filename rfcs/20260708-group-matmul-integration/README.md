@@ -20,8 +20,7 @@ therefore gets correctness but not performance.
 
 The proposal is `zen_grouped_matmul_t`, a ZenDNN-backed CPU implementation
 registered ahead of `ref_grouped_t` (mechanism in
-[§3.3](#33-cpu-registration)). It reuses the opt-in
-`zen64` module from the
+[§3.3](#33-cpu-registration)). It reuses the opt-in `zen64` module from the
 [ZenDNN integration RFC](../20260616-zendnn-integration/README.md) and adds no
 public API changes.
 
@@ -59,11 +58,14 @@ otherwise. That grouped path is a hand-written, framework-side kernel.
 ZenDNN provides an equivalent Group GEMM op that is consistently faster than the
 series-of-matmul loop. The tables below show this at three levels: at the GEMM-op
 and model-decode levels we compare the two ZenDNN kernels (series-of-matmul vs
-N-tile grouped), and end to end in vLLM we compare the native path against the
-ZenDNN-accelerated (`zentorch`) path. All numbers are on AMD Turin (128 cores, 128 threads).
+Grouped N-tile), and end to end in vLLM we compare the native path against the
+ZenDNN-accelerated (`zentorch`) path. All numbers are on AMD Turin (128 cores,
+128 threads).
 
 At the op level, MoE GEMM sweeps (bf16, `K=2880`, `N=5760`, top-k 4) are bucketed
-by the GEMM op count per decode step, which varies with routing:
+by the GEMM op count per decode step, which varies with routing. The grouped
+kernel is ~2.2-2.8x faster at small and medium op counts and ~1.8-1.9x at large
+counts: pooling experts helps most when each expert is tiny.
 
 | Op count / step | BS8 | BS16 | BS32 |
 |---|---|---|---|
@@ -71,10 +73,10 @@ by the GEMM op count per decode step, which varies with routing:
 | medium (11-20) | 2.8x | 2.4x | 2.4x |
 | large (>=21)   | 1.9x | 1.8x | 1.9x |
 
-The grouped kernel is ~2.2-2.8x faster at small and medium op counts and
-~1.8-1.9x at large counts: pooling experts helps most when each expert is tiny.
-
-At the model level, decode throughput (output tokens/s, input/output length 128):
+At the model level, ZenDNN decode throughput (output tokens/s, input/output
+length 128) with its series-of-matmul vs Grouped N-tile kernel. The gain is
+largest on the smaller, more skewed expert workload (Qwen3-30B-A3B, ~1.8x), where
+a series of small matmuls leaves cores idle.
 
 | Model | Batch | Series of matmul | Grouped N-tile | Speedup |
 |---|---|---|---|---|
@@ -83,12 +85,8 @@ At the model level, decode throughput (output tokens/s, input/output length 128)
 | Qwen/Qwen3-30B-A3B         | 16 | 77.36  | 136.07 | 1.76x |
 | Qwen/Qwen3-30B-A3B         | 8  | 58.58  | 104.49 | 1.78x |
 
-The gain is largest on the smaller, more skewed expert workload
-(Qwen3-30B-A3B, ~1.8x), which is where a series of small matmuls leaves cores
-idle.
-
-End to end in vLLM, decode throughput for the native path vs the
-ZenDNN-accelerated (`zentorch`) path, batch 32:
+End to end in vLLM, decode throughput comparing vLLM's native grouped-matmul path
+against the ZenDNN grouped matmul (via `zentorch`), batch 32:
 
 | Model | Native (tok/s) | ZenDNN (tok/s) | Speedup |
 |---|---|---|---|
@@ -207,8 +205,9 @@ so dispatch falls through to `ref_grouped_t`.
 ### 3.4 Data-model bridge
 
 oneDNN stores grouped tensors as concatenated values plus an `s32` offsets buffer
-(see the grouped-GEMM RFC); ZenDNN's `group_matmul_direct` takes per-group
-pointer and shape vectors. `execute()` bridges the two:
+(see the [grouped-GEMM RFC](../20251203-grouped-gemm-support/README.md)).
+ZenDNN's `group_matmul_direct` takes per-group pointer and shape vectors, and
+`execute()` bridges the two:
 
 - reads `src` values and offsets, `dst` values and offsets, dense weights, and
   optional bias;
@@ -248,9 +247,8 @@ onednn_verbose,v1,primitive,exec,cpu,matmul,zen:grouped_matmul,undef,
 ```
 
 `zen:grouped_matmul` (the verbose name for `zen_grouped_matmul_t`) confirms the
-ZenDNN implementation ran. The grouped
-`src`/`dst` and the dense `acb` weights are visible; `16x32:3x32x24` is 3 experts
-sharing `K=32`, `N=24` over 16 total rows.
+ZenDNN implementation ran. The grouped `src`/`dst` and the dense `acb` weights are
+visible; `16x32:3x32x24` is 3 experts sharing `K=32`, `N=24` over 16 total rows.
 
 ### 4.2 Accuracy
 
