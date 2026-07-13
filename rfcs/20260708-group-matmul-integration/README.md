@@ -31,10 +31,7 @@ MoE FFNs are standard in current large models (Mixtral, DeepSeek, Qwen-MoE).
 Their core compute is a grouped matmul: many independent GEMMs that share `K` and
 `N` but have a different, routing-dependent `M` per expert.
 
-### Why grouped matmul helps on CPU
-
-The benefit on CPU is not the GPU argument (fewer kernel launches, device-side
-offsets). It is core occupancy: how much independent work is visible to the
+On CPU the benefit is core occupancy: how much independent work is visible to the
 scheduler at one instant. This is the hard case during decode, where `M` is tiny,
 on high-core-count parts (64-128 cores).
 
@@ -51,8 +48,6 @@ on high-core-count parts (64-128 cores).
 The right strategy is phase-dependent: prefill has large `M`, so a series of
 matmuls already saturates the cores; decode has tiny `M`, where the grouped
 N-tile path wins by pooling work across experts.
-
-### Evidence
 
 vLLM already carries both paths on CPU: a torch loop with one matmul per expert
 (`forward_torch` to `cpu_fused_moe_torch`) and a grouped-GEMM path
@@ -106,6 +101,9 @@ input/output length 128:
 | Qwen3-30B-A3B-Instruct-2507 | 235.06 | 250.53 | 1.07x |
 | Qwen3-30B-A3B               | 229.43 | 235.67 | 1.03x |
 
+These gains are available today through the `zentorch` vLLM plugin, which calls
+ZenDNN directly.
+
 ### Why this belongs in the library
 
 - Reuse: it plugs into oneDNN's existing microkernels, scratchpad, and threading
@@ -124,13 +122,15 @@ cross-vendor discussion, can proceed with the vLLM community on its own timeline
 
 ## 2. Non-Goals
 
-- Replacing `ref_grouped_t`. It stays as the portable fallback.
-- New public API or a new primitive. This is an implementation behind the
-  existing grouped matmul.
+This RFC does not touch any of the following:
+
+- `ref_grouped_t`, which stays as-is and remains the portable fallback.
+- The public API. This is an implementation behind the existing grouped matmul;
+  no new API or primitive is added.
+- The Intel GPU grouped path (`grouped_micro_gemm_t`).
 - f16, quantization (scales / zero-points / weight-only), fused gated
-  activations, and MoE weighted-reduce in the first PR. These are declined at
-  dispatch and left to follow-ups.
-- The Intel GPU grouped path (`grouped_micro_gemm_t`), which is untouched.
+  activations, and MoE weighted-reduce. These are out of scope for the first PR,
+  declined at dispatch, and left to follow-ups.
 
 ## 3. Proposal
 
@@ -141,7 +141,7 @@ when the module is off.
 ### 3.1 Architecture overview
 
 ```
-   framework  (PyTorch · Zentorch · vLLM · …)
+   framework  (PyTorch · llma.cpp · vLLM · …)
                                   │  MoE layer → grouped memory descriptor
                                   ▼
 ┌───────────────────────── oneDNN Library ──────────────────────────┐
@@ -157,7 +157,7 @@ when the module is off.
 │         ║   runtime:  AMD vendor + AVX-512              ║         │
 │         ║                                               ║         │
 │         ║   • registered ahead of ref_grouped_t         ║         │
-│         ║   • pd_t::init() validation gate               ║         │
+│         ║   • pd_t::init() validation gate              ║         │
 │         ║   • grouped src/dst · dense 3D [G,K,N]        ║         │
 │         ║   • f32 / bf16 / bf16→f32 · post-ops          ║         │
 │         ╚═══════════════════════╤═══════════════════════╝         │
@@ -171,12 +171,9 @@ when the module is off.
 └──────────────────────┼────────────────────────────────────────────┘
                        │  group_matmul_direct(…) (per-expert vectors)
                        ▼
-             ┌──────────────────────────┐
-             │      ZenDNN library      │
-             │  (linked when build      │
-             │   flag is ON, default    │
-             │   OFF)                   │
-             └──────────────────────────┘
+                ┌───────────────────┐
+                |  ZenDNN library   │
+                └───────────────────┘
 ```
 
 Gating follows the `zen64` module unchanged: build-time `DNNL_X64_USE_ZEN=ON`
@@ -184,30 +181,43 @@ Gating follows the `zen64` module unchanged: build-time `DNNL_X64_USE_ZEN=ON`
 runtime AMD + AVX-512 check inside `pd_t::init()` with no environment variable.
 The only addition here is the grouped feature flag on the registration macro.
 
-### 3.2 Operation semantics
-
-For `g = 0 .. G-1`, with per-expert row count `M_g` derived from the offsets:
-
-```
-dst_g[M_g, N] = src_g[M_g, K] · W_g[K, N]  (+ bias_g[N])  (+ post-ops)
-```
-
-`src` and `dst` are slices of the concatenated grouped buffers; `W_g` is
-`weights[g]`.
-
 ### 3.3 CPU registration
 
-`zen_grouped_matmul_t` lives at
-`src/cpu/x64/zen64/matmul/zen_grouped_matmul.{hpp,cpp}` (namespace
-`dnnl::impl::cpu::x64::zen::matmul`), including ZenDNN headers under
-`#if DNNL_X64_USE_ZEN`, following the existing `zen_matmul_t`. A new macro
-`CPU_INSTANCE_X64_ZEN_GROUPED(...)` in `src/cpu/cpu_engine.hpp` is
-`CPU_INSTANCE_X64_ZEN(...)` additionally gated on
-`ONEDNN_EXPERIMENTAL_GROUPED_MEMORY`, registered in
-`src/cpu/matmul/cpu_matmul_list.cpp` immediately before
-`CPU_INSTANCE_GROUPED(ref_grouped_t)`. Build wiring reuses the module's
-`cmake/ZenDNN.cmake` with no global include changes. Unsupported cases return
-`status::unimplemented`, so dispatch falls through to `ref_grouped_t`.
+The matmul impl list (`src/cpu/matmul/cpu_matmul_list.cpp`) gains one new entry,
+placed immediately ahead of the reference grouped impl:
+
+```cpp
+constexpr impl_list_item_t impl_list[] = REG_MATMUL_P({
+        // ...existing entries...
+        CPU_INSTANCE_X64_ZEN_GROUPED(zen_grouped_matmul_t)  // new, tried first
+        CPU_INSTANCE_GROUPED(ref_grouped_t)
+        nullptr,
+});
+```
+
+Registration uses the dedicated `CPU_INSTANCE_X64_ZEN_GROUPED(...)` wrapper in
+`src/cpu/cpu_engine.hpp`, which reuses the Zen wrapper and adds the
+grouped-memory gate:
+
+```cpp
+#if DNNL_EXPERIMENTAL_GROUPED_MEMORY
+#define CPU_INSTANCE_X64_ZEN_GROUPED(...) CPU_INSTANCE_X64_ZEN(__VA_ARGS__)
+#else
+#define CPU_INSTANCE_X64_ZEN_GROUPED(...)
+#endif
+```
+
+`CPU_INSTANCE_X64_ZEN(...)` in turn expands only when both `DNNL_X64` and
+`DNNL_X64_USE_ZEN` are set (via `DNNL_X64_ZEN` in `src/cpu/platform.hpp`), so the
+entry is compiled only when the Zen module and grouped memory are both enabled and
+is dropped otherwise.
+
+The impl lives at `src/cpu/x64/zen64/matmul/zen_grouped_matmul.{hpp,cpp}`
+(namespace `dnnl::impl::cpu::x64::zen::matmul`), guards its body under
+`#if DNNL_X64_USE_ZEN && DNNL_EXPERIMENTAL_GROUPED_MEMORY`, and follows the
+existing `zen_matmul_t`. Build wiring reuses the module's `cmake/ZenDNN.cmake`
+with no global include changes. Unsupported cases return `status::unimplemented`,
+so dispatch falls through to `ref_grouped_t`.
 
 ### 3.4 Data-model bridge
 
@@ -226,8 +236,8 @@ pointer and shape vectors. `execute()` bridges the two:
 ### 3.5 Data types and post-ops
 
 Data-type coverage matches `zen_matmul_t`: uniform f32, uniform bf16, and bf16 to
-f32 (bf16 src/weights, f32 dst). f16 is excluded (it needs AVX-512-FP16, absent
-on the Zen target); int8 and weight-only quantization are declined.
+f32 (bf16 src/weights, f32 dst). f16, int8, and weight-only quantization are
+declined in the first PR and deferred to a follow-up.
 
 Supported post-ops, validated per entry (an unsupported chain falls back to the
 reference):
@@ -266,9 +276,10 @@ to `ref_grouped_t` and pass.
 
 ## 5. Framework-Side Changes
 
-None. A framework that already issues an MoE layer as `dnnl::matmul` with grouped
-memory gets the ZenDNN path automatically on supported AMD systems, and the
-reference otherwise. Applications need no source changes.
+A framework backend must route its MoE expert GEMM to `dnnl::matmul` with grouped
+memory; we plan separate RFCs in vLLM and PyTorch for this mapping. End-user
+applications are unchanged. Once mapped, the same call is accelerated by oneDNN on
+any supported platform, keeping the tuning in one place.
 
 ## 6. First PR - Scope and Acceptance Criteria
 
@@ -283,13 +294,12 @@ The first PR is complete when the following hold on CPU:
 - The default build (`DNNL_X64_USE_ZEN=OFF`) is unaffected; `test_iface_grouped`
   and the grouped benchdnn inputs pass with the module off.
 
-Follow-up work: benchmark-driven perf validation, plus the items deferred in §2
-(f16, quantization, fused gated activations).
-
 ## 7. Alternatives Considered
 
 - Keep only `ref_grouped_t` on CPU. No new backend and simplest, but no optimized
-  CPU MoE path; frameworks keep integrating ZenDNN separately (today's state).
+  CPU MoE path in oneDNN. The optimized grouped kernel then stays in ZenDNN,
+  reachable only through the `zentorch` plugin and not directly available to the
+  broader framework ecosystem.
 - Serve the grouped problem with regular matmul (runtime dimensions) or BRGEMM
   microkernels per expert.
 - Register a ZenDNN-backed grouped implementation behind the existing API (this
