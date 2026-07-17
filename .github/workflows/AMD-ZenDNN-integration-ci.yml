@@ -1,0 +1,76 @@
+# *******************************************************************************
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Caller workflow on zendnn-onednn-integration. Heavy CI lives on branch
+# zendnn-ci (zendnn-ci-reusable.yml).
+#
+# Triggers:
+# - push/pull_request to zendnn-onednn-integration
+# - /retest comment on PR (re-runs CI, useful after ZenDNN PR updates)
+# - Depends-On: ZenDNN#123 in PR comment/description (cherry-picks ZenDNN PR)
+# *******************************************************************************
+
+name: ZenDNN integration CI
+
+on:
+  push:
+    branches: [zendnn-onednn-integration]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [zendnn-onednn-integration]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: zendnn-integration-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  # Check if this is a /retest command on a PR
+  check-retest:
+    if: >
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && contains(github.event.comment.body, '/retest'))
+    runs-on: [self-hosted, jira_check_runner]
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      pr_ref: ${{ steps.check.outputs.pr_ref }}
+    steps:
+      - name: Check trigger
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.ZIAIE_PAT }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "Triggered by /retest comment on PR #${{ github.event.issue.number }}"
+            # Get PR head ref
+            PR_DATA=$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+            PR_REF=$(echo "${PR_DATA}" | python3 -c "import json,sys; print(json.load(sys.stdin)['head']['ref'])")
+            PR_BASE=$(echo "${PR_DATA}" | python3 -c "import json,sys; print(json.load(sys.stdin)['base']['ref'])")
+            if [ "${PR_BASE}" = "zendnn-onednn-integration" ]; then
+              echo "should_run=true" >> $GITHUB_OUTPUT
+              echo "pr_ref=${PR_REF}" >> $GITHUB_OUTPUT
+            else
+              echo "PR base is ${PR_BASE}, not zendnn-onednn-integration. Skipping."
+              echo "should_run=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "pr_ref=" >> $GITHUB_OUTPUT
+          fi
+
+  integration:
+    needs: check-retest
+    if: needs.check-retest.outputs.should_run == 'true'
+    uses: AMD-Zenai/oneDNN-Zen/.github/workflows/zendnn-ci-reusable.yml@zendnn-ci
+    with:
+      dnnl_x64_use_zen: true
+      run_tests: true
+      target_branch: zendnn-onednn-integration
+    secrets: inherit
