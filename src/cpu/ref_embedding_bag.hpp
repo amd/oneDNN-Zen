@@ -40,7 +40,7 @@ struct ref_embedding_bag_fwd_t : public primitive_t {
 
         DECLARE_COMMON_PD_T("ref:any", ref_embedding_bag_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(const engine_t *engine) {
             using namespace data_type;
 
             VDISPATCH_EMBEDDING_BAG(is_fwd(), VERBOSE_BAD_PROPKIND);
