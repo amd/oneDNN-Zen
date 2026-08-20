@@ -31,6 +31,16 @@ else()
     set(_omp_severity "FATAL_ERROR")
 endif()
 
+# ZenDNN and AOCL-DLP are built against the LLVM OpenMP runtime, so on MSVC
+# oneDNN has to select it too: two OpenMP runtimes in one process (vcomp +
+# libomp) do not share a thread pool and silently corrupt work partitioning
+# rather than failing to link. Set here rather than in ZenDNN.cmake because
+# that file is included after find_package(OpenMP) below has already run.
+# Requires CMake >= 3.30, which ZenDNN.cmake enforces.
+if(MSVC AND DNNL_X64_USE_ZEN)
+    set(OpenMP_RUNTIME_MSVC "llvm")
+endif()
+
 if(DPCPP_HOST_COMPILER_KIND STREQUAL "DEFAULT")
     # XXX: workaround: when -fsycl is specified the compiler doesn't define
     # _OPENMP macro causing `find_package(OpenMP)` to fail.
