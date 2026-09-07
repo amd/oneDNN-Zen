@@ -25,6 +25,18 @@ if(NOT DNNL_X64_USE_ZEN)
     return()
 endif()
 
+# ZenDNN provides x86_64 kernels only. Checked before every other requirement
+# below: without it, configuration completes on a non-x64 target and the x64
+# ZenDNN library is still linked into dnnl (src/CMakeLists.txt gates that on
+# DNNL_X64_USE_ZEN alone), so the mismatch only surfaces at link time as an
+# object machine-type conflict.
+if(NOT DNNL_TARGET_ARCH STREQUAL "X64")
+    message(FATAL_ERROR
+        "ONEDNN_X64_USE_ZEN=ON requires an x86_64 target; ZenDNN provides "
+        "x86_64 kernels only. Current DNNL_TARGET_ARCH: ${DNNL_TARGET_ARCH}. "
+        "Configure with -DONEDNN_X64_USE_ZEN=OFF.")
+endif()
+
 # On Windows, ZenDNN is built against the LLVM OpenMP runtime (/openmp:llvm).
 # OpenMP_RUNTIME_MSVC, which selects it here, is only honored by CMake >= 3.30;
 # on older CMake it is silently ignored and this build falls back to MSVC's
@@ -66,7 +78,7 @@ endif()
 # Minimum supported ZenDNN version. With ONEDNN_X64_USE_ZEN=ON, a missing ZenDNN
 # fails configuration (see the FATAL_ERROR below); a ZenDNN that is present but
 # older than this is treated as a misconfiguration and also fails the build.
-set(ZENDNN_MIN_VERSION "6.0.0")
+set(ZENDNN_MIN_VERSION "6.0.1")
 find_package(zendnnl CONFIG)
 
 if(NOT zendnnl_FOUND)
@@ -91,7 +103,7 @@ elseif("${zendnnl_VERSION}" VERSION_LESS "${ZENDNN_MIN_VERSION}")
         "Update ZenDNN, or configure with -DONEDNN_X64_USE_ZEN=OFF.")
 endif()
 
-# Require GCC >= 11.2, Clang >= 14, or MSVC >= 19.40.
+# Require GCC >= 11.2, Clang >= 14, or MSVC >= 19.43.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "11.2")
         message(FATAL_ERROR
@@ -109,10 +121,10 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
             "Upgrade Clang, or configure with -DONEDNN_X64_USE_ZEN=OFF.")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "19.40")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "19.43")
         message(FATAL_ERROR
-            "ONEDNN_X64_USE_ZEN=ON requires MSVC >= 19.40 (Visual Studio 2022 "
-            "17.10), the toolset the ZenDNN Windows port is built and tested "
+            "ONEDNN_X64_USE_ZEN=ON requires MSVC >= 19.43 (Visual Studio 2022 "
+            "17.13), the toolset the ZenDNN Windows port is built and tested "
             "with. Current C++ compiler: ${CMAKE_CXX_COMPILER_ID} "
             "${CMAKE_CXX_COMPILER_VERSION}. "
             "Upgrade MSVC, or configure with -DONEDNN_X64_USE_ZEN=OFF.")
@@ -120,7 +132,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 else()
     message(FATAL_ERROR
         "ONEDNN_X64_USE_ZEN=ON requires GCC >= 11.2, Clang >= 14, or "
-        "MSVC >= 19.40; ZenDNN does not support other compilers. "
+        "MSVC >= 19.43; ZenDNN does not support other compilers. "
         "Current C++ compiler: "
         "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}. "
         "Build with GCC, Clang or MSVC, or configure with "

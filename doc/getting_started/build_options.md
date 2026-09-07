@@ -403,10 +403,11 @@ When `ONEDNN_X64_USE_ZEN=ON`, the following additional requirements apply
 * Targets x86_64 on Linux or Windows.
 * Requires CMake 3.26 or later, and 3.30 or later on Windows (see the OpenMP
   note below).
-* Requires GCC 11.2 or later, Clang 14 or later, or MSVC 19.40 or later
-  (Visual Studio 2022 17.10); other compilers are rejected.
-* Requires ZenDNN version 6.0.0 or later. Both static (archive) and shared
-  ZenDNN builds are supported.
+* Requires GCC 11.2 or later, Clang 14 or later, or MSVC 19.43 or later
+  (Visual Studio 2022 17.13); other compilers are rejected.
+* Requires ZenDNN version 6.0.1 or later; on Windows, ZenDNN tag
+  `zendnn-2026-WW37` or later. Both static (archive) and shared ZenDNN builds
+  are supported.
 * Requires `ONEDNN_CPU_RUNTIME=OMP`; ZenDNN only supports the OpenMP threading
   runtime, and other runtimes are rejected at configure time.
 
