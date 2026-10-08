@@ -9,6 +9,10 @@
 # - push/pull_request to zendnn-onednn-integration
 # - /retest comment on PR (re-runs CI, useful after ZenDNN PR updates)
 # - Depends-On: ZenDNN#123 in PR comment/description (cherry-picks ZenDNN PR)
+# - workflow_dispatch from AMD-Zenai/ZenDNN on every PR and every push to main.
+#   GitHub accepts this because the workflow already has runs. The ref is
+#   zendnn-onednn-integration. zendnn_sha selects the ZenDNN commit, and a
+#   commit status with this run URL is posted back for the Teams card.
 # *******************************************************************************
 
 name: ZenDNN integration CI
@@ -21,9 +25,56 @@ on:
     branches: [zendnn-onednn-integration]
   issue_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      zendnn_ref:
+        description: 'ZenDNN branch that triggered this run (used to group concurrency)'
+        required: false
+        default: ''
+        type: string
+      zendnn_sha:
+        description: 'ZenDNN commit SHA to build and to receive the commit status'
+        required: false
+        default: ''
+        type: string
+      zendnn_pr_number:
+        description: 'ZenDNN pull request number, when this run was triggered by a PR'
+        required: false
+        default: ''
+        type: string
+      zendnn_pr_url:
+        description: 'ZenDNN pull request URL'
+        required: false
+        default: ''
+        type: string
+      zendnn_pr_title:
+        description: 'ZenDNN pull request title or push commit subject'
+        required: false
+        default: ''
+        type: string
+      zendnn_pr_author:
+        description: 'ZenDNN pull request author or pusher'
+        required: false
+        default: ''
+        type: string
+      triggering_event:
+        description: 'ZenDNN event that requested this run (pull_request or push)'
+        required: false
+        default: ''
+        type: string
 
+# Library dispatches are namespaced with lib- so ZenDNN PR 81 cannot cancel
+# oneDNN PR 81. A newer dispatch for the same ZenDNN PR or branch supersedes
+# the previous one.
 concurrency:
-  group: zendnn-integration-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  group: >-
+    zendnn-integration-ci-${{ github.workflow }}-${{
+      github.event_name == 'workflow_dispatch'
+      && format('lib-{0}', github.event.inputs.zendnn_pr_number || github.event.inputs.zendnn_ref || github.event.inputs.zendnn_sha)
+      || github.event.pull_request.number
+      || github.event.issue.number
+      || github.ref
+    }}
   cancel-in-progress: true
 
 permissions: read-all
@@ -74,3 +125,63 @@ jobs:
       run_tests: true
       target_branch: zendnn-onednn-integration
     secrets: inherit
+
+  # Post the run URL onto the ZenDNN commit before the matrix starts, so the
+  # ZenDNN Teams card can link here while the oneDNN runners are still queued.
+  report-pending:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.zendnn_sha != ''
+    runs-on: [self-hosted, jira_check_runner]
+    steps:
+      - name: Post pending status to ZenDNN
+        env:
+          GH_TOKEN: ${{ secrets.ZIAIE_PAT }}
+          ZENDNN_SHA: ${{ github.event.inputs.zendnn_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "ZenDNN ${ZENDNN_SHA} (${{ github.event.inputs.triggering_event }})"
+          echo "PR: ${{ github.event.inputs.zendnn_pr_url }}"
+          echo "Run: ${RUN_URL}"
+          http_code=$(curl -sS -o /tmp/status.json -w '%{http_code}' -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/AMD-Zenai/ZenDNN/statuses/${ZENDNN_SHA}" \
+            -d "{\"state\":\"pending\",\"target_url\":\"${RUN_URL}\",\"context\":\"AMD-Zenai/oneDNN-Zen CI\",\"description\":\"oneDNN-Zen integration CI started\"}")
+          echo "HTTP ${http_code}"
+          cat /tmp/status.json || true
+          echo ""
+          if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            exit 1
+          fi
+
+  report-result:
+    needs: integration
+    if: always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.event.inputs.zendnn_sha != ''
+    runs-on: [self-hosted, jira_check_runner]
+    steps:
+      - name: Post final status to ZenDNN
+        env:
+          GH_TOKEN: ${{ secrets.ZIAIE_PAT }}
+          ZENDNN_SHA: ${{ github.event.inputs.zendnn_sha }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "${INTEGRATION_RESULT}" in
+            success) state="success" ;;
+            failure) state="failure" ;;
+            *) state="error" ;;
+          esac
+          echo "Reporting ${state} for integration result ${INTEGRATION_RESULT}"
+          echo "Run: ${RUN_URL}"
+          http_code=$(curl -sS -o /tmp/status.json -w '%{http_code}' -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/AMD-Zenai/ZenDNN/statuses/${ZENDNN_SHA}" \
+            -d "{\"state\":\"${state}\",\"target_url\":\"${RUN_URL}\",\"context\":\"AMD-Zenai/oneDNN-Zen CI\",\"description\":\"oneDNN-Zen integration CI ${state}\"}")
+          echo "HTTP ${http_code}"
+          cat /tmp/status.json || true
+          echo ""
+          if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            exit 1
+          fi
